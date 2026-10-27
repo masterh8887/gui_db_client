@@ -1,0 +1,9 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "dev": { "cache": false, "persistent": true },
+    "build": { "dependsOn": ["^build"], "outputs": ["out/**", "$TURBO_ROOT$/target/release/bundle/**"] },
+    "lint": { "dependsOn": ["^build"] },
+    "test": { "dependsOn": ["^build"], "cache": false }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "bulkdb",
+  "private": true,
+  "packageManager": "pnpm@12.14.0",
+  "engines": {
+    "node": ">=22",
+    "pnpm": "12.14.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "core:test": "cargo test -p bulk-core",
+    "core:bench": "cargo bench -p bulk-core --bench pipeline",
+    "cli": "cargo run -p bulk-cli --",
+    "typegen": "cargo test -p bulk-core --features ts-export export_bindings",
+    "typegen:check": "node scripts/typegen-check.mjs"
+  },
+  "devDependencies": {
+    "turbo": "^2"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "bulk-core",
+  "private": true,
+  "scripts": {
+    "build": "cargo build -p bulk-core",
+    "lint": "cargo clippy -p bulk-core --all-targets -- -D warnings",
+    "test": "cargo test -p bulk-core"
+  }
+}

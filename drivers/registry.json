@@ -1,0 +1,76 @@
+[
+  {
+    "id": "postgres",
+    "name": "PostgreSQL",
+    "tier": "builtin",
+    "source": "postgres",
+    "fields": ["host", "port", "database", "user", "password", "sslmode"],
+    "defaults": { "port": "5432", "sslmode": "prefer" },
+    "session_opts": ["work_mem", "statement_timeout", "lock_timeout", "max_parallel_workers_per_gather"]
+  },
+  {
+    "id": "mysql",
+    "name": "MySQL / MariaDB",
+    "tier": "builtin",
+    "source": "mysql",
+    "fields": ["host", "port", "database", "user", "password", "sslmode"],
+    "defaults": { "port": "3306", "sslmode": "prefer" },
+    "session_opts": ["max_execution_time", "net_read_timeout", "fetch_batch"]
+  },
+  {
+    "id": "mssql",
+    "name": "SQL Server",
+    "tier": "builtin",
+    "source": "mssql",
+    "fields": ["host", "port", "database", "user", "password", "instance", "encrypt", "trust_server_certificate"],
+    "defaults": { "port": "1433", "encrypt": "true", "trust_server_certificate": "false" },
+    "session_opts": ["lock_timeout", "fetch_batch"]
+  },
+  {
+    "id": "sqlite",
+    "name": "SQLite",
+    "tier": "builtin",
+    "source": "sqlite",
+    "fields": ["path"],
+    "defaults": {},
+    "session_opts": ["fetch_batch"]
+  },
+  {
+    "id": "oracle",
+    "name": "Oracle Database",
+    "tier": "vendor-client",
+    "source": "oracle",
+    "requires": {
+      "windows": { "library": "oci.dll", "probe": ["%ORACLE_HOME%\\bin", "C:\\oracle\\instantclient*", "%PATH%"] },
+      "macos": { "library": "libclntsh.dylib", "probe": ["$ORACLE_HOME/lib", "/opt/oracle/instantclient*", "$DYLD_LIBRARY_PATH"] },
+      "linux": { "library": "libclntsh.so", "probe": ["$ORACLE_HOME/lib", "/opt/oracle/instantclient*", "$LD_LIBRARY_PATH"] }
+    },
+    "install": {
+      "label": "Oracle Instant Client 21 (Basic)",
+      "windows": "https://www.oracle.com/database/technologies/instant-client/winx64-64-downloads.html",
+      "macos": "https://www.oracle.com/database/technologies/instant-client/macos-arm64-downloads.html",
+      "linux": "https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html"
+    },
+    "fields": ["host", "port", "service_name", "user", "password"],
+    "defaults": { "port": "1521" },
+    "session_opts": ["statement_timeout", "fetch_batch"]
+  },
+  {
+    "id": "odbc",
+    "name": "ODBC (generic)",
+    "tier": "odbc",
+    "source": "odbc",
+    "requires": {
+      "macos": { "library": "libodbc.dylib", "probe": ["/opt/homebrew/lib", "/usr/local/lib"] },
+      "linux": { "library": "libodbc.so", "probe": ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"] }
+    },
+    "install": {
+      "label": "unixODBC",
+      "macos": "brew install unixodbc",
+      "linux": "apt install unixodbc"
+    },
+    "fields": ["driver", "connection_string", "user", "password"],
+    "defaults": {},
+    "session_opts": ["fetch_batch"]
+  }
+]

@@ -1,0 +1,95 @@
+@import 'tailwindcss';
+
+/* Desktop density: 13px base, 28px rows, tight spacing. */
+:root {
+  --background: #ffffff;
+  --foreground: #1a1a1a;
+  --muted: #f4f4f5;
+  --muted-foreground: #6b7280;
+  --border: #e4e4e7;
+  --accent: #2563eb;
+  --accent-foreground: #ffffff;
+  --danger: #dc2626;
+  --warning: #d97706;
+  --success: #16a34a;
+  --row-height: 28px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --background: #141518;
+    --foreground: #e6e6e6;
+    --muted: #1e2024;
+    --muted-foreground: #9ca3af;
+    --border: #2b2e34;
+    --accent: #3b82f6;
+    --accent-foreground: #ffffff;
+    --danger: #ef4444;
+    --warning: #f59e0b;
+    --success: #22c55e;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --background: #141518;
+  --foreground: #e6e6e6;
+  --muted: #1e2024;
+  --muted-foreground: #9ca3af;
+  --border: #2b2e34;
+  --accent: #3b82f6;
+  --accent-foreground: #ffffff;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --success: #22c55e;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+}
+
+html,
+body {
+  font-size: 13px;
+  font-family:
+    -apple-system, 'Segoe UI', 'Malgun Gothic', 'Apple SD Gothic Neo', system-ui, sans-serif;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+* {
+  border-color: var(--border);
+}
+
+/* Indeterminate progress bar (monitor cards). */
+@keyframes slide {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+/* Native-feeling scrollbars in the WebView. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted-foreground) 35%, transparent);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}

@@ -1,0 +1,3 @@
+# ts-rs writes LF. Keep the generated bindings LF in every checkout (also with
+# core.autocrlf=true on Windows) so regenerating them never changes their bytes.
+src/generated/*.ts text eol=lf

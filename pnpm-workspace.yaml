@@ -1,0 +1,25 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "crates/*" # thin package.json wrappers around cargo so turbo can drive them
+
+# Packages whose install scripts may run (pnpm 12 blocks everything else).
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
+  "@tailwindcss/oxide": true
+  sharp: true
+
+# `pnpm audit --audit-level high` is a CI gate (spec section 13). Every entry below is a known
+# advisory that is tolerated on purpose; each needs a reason, and is removed as soon as the fix
+# lands in the lockfile. Add new entries with `pnpm audit --ignore <GHSA>`, never by turning the
+# gate off.
+auditConfig:
+  ignoreGhsas:
+    # tinypool <2.1.2 prototype-pollution gadgets (critical). Reached only through
+    # apps/desktop > vitest@3 > tinypool@1.1.1: the dev-time unit-test runner, which never ships
+    # in the static export or the Tauri bundle and only runs our own test files. vitest 3 pins
+    # tinypool ^1; the patched tinypool 2.1.2 needs vitest >= 4.1.12 (which also clears the
+    # moderate GHSA-82fw-gwwq-j7x9 / GHSA-qxg6-89mg-rqv8). Drop both lines with that upgrade.
+    - GHSA-5gmw-xhrv-c9v3
+    - GHSA-85c8-ppgw-ccpr
