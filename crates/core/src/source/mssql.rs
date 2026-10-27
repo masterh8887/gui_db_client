@@ -414,6 +414,17 @@ fn unsupported_hint(ty: ColumnType) -> Option<&'static str> {
     }
 }
 
+/// Round a legacy `datetime` value to the millisecond.
+///
+/// `datetime` is stored in 1/300 s ticks, so `'05.123'` is really 05.1233333 s. SQL Server,
+/// sqlcmd, bcp and SSMS all render it at its documented millisecond accuracy (`.123`, `.997`),
+/// and an export should show the same value rather than `.123333`. Ticks are k/300 s, i.e.
+/// k·3.33 ms, so a value never sits exactly between two milliseconds. `datetime2` and
+/// `smalldatetime` are exact and are not rounded.
+pub(crate) fn round_legacy_datetime_micros(micros: i64) -> i64 {
+    (micros + 500).div_euclid(1000) * 1000
+}
+
 /// Push one decoded cell into the batcher, converting to the column's kind.
 fn push_cell(b: &mut ArrowBatcher, data: &ColumnData<'static>, col: usize) -> Result<()> {
     let kind = b.kinds()[col];
@@ -441,7 +452,11 @@ fn push_cell(b: &mut ArrowBatcher, data: &ColumnData<'static>, col: usize) -> Re
             Some(n) => b.push(Cell::Str(&format_numeric(n.value(), n.scale()))),
             None => b.push(Cell::Null),
         },
-        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
+        ColumnData::DateTime(_) => {
+            let v = chrono::NaiveDateTime::from_sql(data).map_err(map_err)?;
+            b.push(v.map(|t| Cell::Timestamp(round_legacy_datetime_micros(micros_from_naive(t)))).unwrap_or(Cell::Null))
+        }
+        ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
             let v = chrono::NaiveDateTime::from_sql(data).map_err(map_err)?;
             b.push(v.map(|t| Cell::Timestamp(micros_from_naive(t))).unwrap_or(Cell::Null))
         }
@@ -1020,6 +1035,37 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             ssl: SslMode::Prefer,
         }
+    }
+
+    /// Legacy `datetime` arrives as days since 1900 + 1/300 s ticks; the export shows it at its
+    /// millisecond accuracy, like SQL Server itself. `datetime2` keeps every digit.
+    #[test]
+    fn legacy_datetime_is_rounded_to_the_millisecond() {
+        use arrow_array::{Array, TimestampMicrosecondArray};
+        let day = |y, m, d| (chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap() - chrono::NaiveDate::from_ymd_opt(1900, 1, 1).unwrap()).num_days() as i32;
+        let base = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap().and_hms_opt(3, 4, 5).unwrap().and_utc().timestamp_micros();
+        let secs = (3 * 3600 + 4 * 60 + 5) * 300;
+        let decode = |data: ColumnData<'static>| {
+            let kinds = vec![ColKind::Timestamp];
+            let mut b = ArrowBatcher::new(schema_from(&[("t".to_string(), ColKind::Timestamp)]), kinds);
+            push_cell(&mut b, &data, 0).unwrap();
+            b.end_row().unwrap();
+            let batch = b.flush().unwrap().unwrap();
+            batch.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0)
+        };
+        let dt = |days, ticks| ColumnData::DateTime(Some(tiberius::time::DateTime::new(days, ticks)));
+
+        // '05.123' is stored as 37 ticks = 0.1233333 s.
+        assert_eq!(decode(dt(day(2024, 1, 2), secs + 37)), base + 123_000);
+        // '05.997' (299 ticks = 0.9966667 s) and a whole second stay what SQL Server shows.
+        assert_eq!(decode(dt(day(2024, 1, 2), secs + 299)), base + 997_000);
+        assert_eq!(decode(dt(day(2024, 1, 2), secs)), base);
+        // Before 1970 (negative epoch micros) rounds the same way: 1753-01-01 00:00:00.003.
+        let early = chrono::NaiveDate::from_ymd_opt(1753, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        assert_eq!(decode(dt(day(1753, 1, 1), 1)), early + 3_000);
+
+        assert_eq!(round_legacy_datetime_micros(-1_876_667), -1_877_000);
+        assert_eq!(round_legacy_datetime_micros(123_333), 123_000);
     }
 
     #[test]

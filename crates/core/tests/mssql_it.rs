@@ -140,6 +140,16 @@ async fn drain(db: &MssqlDatabase, sql: &str, opts: &SessionOpts) -> Vec<RecordB
     batches
 }
 
+/// `connection_id` of the object's current physical connection. Unlike the SPID, which SQL
+/// Server hands to the next login as soon as it is free, it is unique per connection.
+/// (Reading `sys.dm_exec_connections` needs VIEW SERVER STATE; CI connects as `sa`.)
+async fn connection_guid(db: &MssqlDatabase) -> String {
+    let sql = "SELECT CONVERT(nvarchar(36), connection_id) AS cid FROM sys.dm_exec_connections WHERE session_id = @@SPID";
+    let batches = drain(db, sql, &SessionOpts::default()).await;
+    let b = batches.iter().find(|b| b.num_rows() > 0).expect("a row for the own connection");
+    str_col(b, 0).value(0).to_string()
+}
+
 fn str_col(b: &RecordBatch, i: usize) -> &StringArray {
     b.column(i).as_any().downcast_ref::<StringArray>().unwrap_or_else(|| panic!("column {i} is {:?}, not Utf8", b.schema().field(i).data_type()))
 }
@@ -379,6 +389,7 @@ async fn cancel_closes_the_server_session() {
     let Some(db) = connect(&app).await else { return };
     let Some(monitor) = connect("bulkdb-it-monitor").await else { return };
     let spid = db.session_id().expect("spid after connect");
+    let connection_before = connection_guid(&db).await;
     let handle = JobHandle { job_id: "job-cancel".into(), application_name: app.clone(), session_id: Some(spid.clone()), temp_bytes_at_start: None };
 
     let cancel = CancellationToken::new();
@@ -413,7 +424,10 @@ async fn cancel_closes_the_server_session() {
     // The same object reconnects transparently for the next call.
     let info = db.probe().await.unwrap();
     assert_eq!(info.driver, "mssql");
-    assert_ne!(db.session_id().as_deref(), Some(spid.as_str()));
+    assert!(db.session_id().is_some(), "the reconnected object knows its new spid");
+    // The SPID may well be the same number again (SQL Server reuses a freed SPID at once);
+    // the physical connection must be a new one.
+    assert_ne!(connection_guid(&db).await, connection_before, "calls after cancel must run on a new connection");
 }
 
 #[tokio::test]
