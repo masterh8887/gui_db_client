@@ -1,0 +1,25 @@
+[package]
+name = "bulk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BulkDB headless extractor: the Phase 1 performance tool and the scheduler interface"
+
+[[bin]]
+name = "bulk-cli"
+path = "src/main.rs"
+
+[dependencies]
+bulk-core = { path = "../core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+memory-stats = { workspace = true }
+chrono = { workspace = true }
+rpassword = "7"

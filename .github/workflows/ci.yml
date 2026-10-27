@@ -1,0 +1,317 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# Rust toolchain: every job installs the toolchain pinned by rust-toolchain.toml (channel and
+# components) with `rustup toolchain install`. rustup always selects that file's toolchain inside
+# the repo, so installing another one (e.g. `stable`) would only put targets and components on a
+# toolchain cargo never uses.
+
+jobs:
+  core-test:
+    name: core (unit + docker integration + bench gate)
+    runs-on: ubuntu-latest
+    env:
+      # Compile the ODBC source on Linux too (against unixODBC), so clippy and the unit tests
+      # cover it here as well as on Windows.
+      BULKDB_ODBC: "1"
+    services:
+      postgres:
+        image: postgres:15
+        env: { POSTGRES_PASSWORD: bulkdb, POSTGRES_USER: bulkdb, POSTGRES_DB: bulkdb }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bulkdb" --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8
+        env: { MYSQL_ROOT_PASSWORD: bulkdb, MYSQL_DATABASE: bulkdb }
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -pbulkdb" --health-interval 5s --health-timeout 5s --health-retries 30
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env: { ACCEPT_EULA: "Y", MSSQL_SA_PASSWORD: "BulkDb!Passw0rd" }
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'BulkDb!Passw0rd' -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 10s --health-timeout 10s --health-start-period 20s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --exclude bulkdb-desktop --all-targets -- -D warnings
+      - run: cargo test -p bulk-core -p bulk-cli
+        env: { BULKDB_CREDENTIALS: memory }
+      # OpenSSH server for the real-ssh tunnel tests (`openssh_it` in
+      # crates/core/tests/tunnel_tests.rs). Same account and port as the `sshd` service of
+      # docker/compose.yml (tester / tester on 2222), but run on the runner itself so this job
+      # owns its config: loopback only, password and public-key login, TCP forwarding on (the
+      # tests forward to the bastion's own 127.0.0.1:2222, whose SSH banner proves the tunnel),
+      # and `PerSourcePenalties no` where sshd knows the option (OpenSSH >= 9.8 would otherwise
+      # start refusing 127.0.0.1 after the tests' unauthenticated readiness/banner probes).
+      # The client key is generated here for this job only, with a passphrase, so `it_key_auth`
+      # covers the passphrase prompt as well.
+      - name: start OpenSSH server for the tunnel integration tests
+        shell: bash
+        env:
+          SSH_IT_DIR: ${{ runner.temp }}/bulkdb-sshd
+          SSH_IT_KEY_PASSPHRASE: bulkdb-it-key
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+          sudo useradd --create-home --shell /bin/bash tester
+          echo 'tester:tester' | sudo chpasswd
+          mkdir -p "$SSH_IT_DIR"
+          ssh-keygen -q -t ed25519 -N "$SSH_IT_KEY_PASSPHRASE" -C bulkdb-it -f "$SSH_IT_DIR/id_ed25519"
+          sudo install -d -m 700 -o tester -g tester /home/tester/.ssh
+          sudo install -m 600 -o tester -g tester "$SSH_IT_DIR/id_ed25519.pub" /home/tester/.ssh/authorized_keys
+          sudo ssh-keygen -q -t ed25519 -N '' -C bulkdb-it-host -f "$SSH_IT_DIR/ssh_host_ed25519_key"
+          cat > "$SSH_IT_DIR/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $SSH_IT_DIR/ssh_host_ed25519_key
+          PidFile $SSH_IT_DIR/sshd.pid
+          AllowUsers tester
+          PermitRootLogin no
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          AuthorizedKeysFile .ssh/authorized_keys
+          UsePAM yes
+          AllowTcpForwarding yes
+          PermitOpen any
+          MaxStartups 100
+          LogLevel VERBOSE
+          EOF
+          # Privilege separation directory (also needed by `sshd -t`).
+          sudo mkdir -p /run/sshd
+          if sudo /usr/sbin/sshd -t -f "$SSH_IT_DIR/sshd_config" -o PerSourcePenalties=no 2>/dev/null; then
+            echo 'PerSourcePenalties no' >> "$SSH_IT_DIR/sshd_config"
+          fi
+          sudo /usr/sbin/sshd -t -f "$SSH_IT_DIR/sshd_config"
+          sudo /usr/sbin/sshd -f "$SSH_IT_DIR/sshd_config" -E "$SSH_IT_DIR/sshd.log"
+          /usr/sbin/sshd -V 2>&1 || true
+          for _ in $(seq 1 30); do
+            banner=$(timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222 && head -c 4 <&3' 2>/dev/null || true)
+            if [ "$banner" = "SSH-" ]; then
+              echo "sshd is up on 127.0.0.1:2222"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "sshd did not answer on 127.0.0.1:2222"
+          sudo cat "$SSH_IT_DIR/sshd.log" || true
+          exit 1
+      - name: integration tests against docker databases and the OpenSSH server
+        env:
+          BULKDB_PG_URL: postgres://bulkdb:bulkdb@127.0.0.1:5432/bulkdb
+          BULKDB_MYSQL_URL: mysql://root:bulkdb@127.0.0.1:3306/bulkdb
+          # mssql_it.rs parses `mssql://user:pass@host:port/db?field=value` (percent-decoded;
+          # trust_server_certificate defaults to true for the self-signed container cert).
+          BULKDB_MSSQL_URL: "mssql://sa:BulkDb%21Passw0rd@127.0.0.1:1433/master"
+          # tunnel_tests.rs `openssh_it`: the bastion (password login), the key authorized for
+          # the same account and its passphrase, all from the step above. BULKDB_SSH_TARGET is
+          # left unset: the forward target defaults to 127.0.0.1:<bastion port>.
+          BULKDB_SSH_URL: ssh://tester:tester@127.0.0.1:2222
+          BULKDB_SSH_KEY: ${{ runner.temp }}/bulkdb-sshd/id_ed25519
+          BULKDB_SSH_KEY_PASSPHRASE: bulkdb-it-key
+          BULKDB_CREDENTIALS: memory
+        run: cargo test -p bulk-core --features it
+      - name: sshd log (on failure)
+        if: failure()
+        shell: bash
+        run: sudo cat "${{ runner.temp }}/bulkdb-sshd/sshd.log" 2>/dev/null || echo "no sshd log"
+      # Baseline = the results of the last successful push to main on this OS (cache entries
+      # written on main are readable from pull requests). No baseline yet: only the peak-RSS
+      # and row-count checks apply.
+      - name: restore bench baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-baseline.json
+          key: bench-baseline-${{ runner.os }}-${{ github.sha }}
+          restore-keys: bench-baseline-${{ runner.os }}-
+      - name: pipeline bench gate (fails on >5% throughput regression or peak RSS >= 100 MB)
+        # `shell: bash` runs with `-o pipefail`, so `| tee` keeps the bench's exit code.
+        shell: bash
+        run: |
+          cargo bench -p bulk-core --bench pipeline -- --gate \
+            --baseline "$GITHUB_WORKSPACE/bench-baseline.json" \
+            --save "$GITHUB_WORKSPACE/bench-result.json" 2>&1 | tee bench.txt
+      - name: record bench baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cp bench-result.json bench-baseline.json
+      - name: save bench baseline (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: bench-baseline.json
+          key: bench-baseline-${{ runner.os }}-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: |
+            bench.txt
+            bench-result.json
+          if-no-files-found: ignore
+      - run: cargo install cargo-audit --locked && cargo audit
+
+  typegen-check:
+    name: ipc-types match Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with: { version: 12.14.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typegen:check
+      - run: pnpm --filter desktop lint
+      - run: pnpm --filter desktop test
+      # Gate (spec section 13): fails on any high/critical advisory. Tolerated advisories are
+      # listed, with their reasons, under `auditConfig.ignoreGhsas` in pnpm-workspace.yaml.
+      - name: pnpm audit gate (high and critical)
+        run: pnpm audit --audit-level high
+
+  # Tauri bundles land in the *workspace* target dir (apps/desktop/src-tauri is a workspace
+  # member): target/release/bundle/... and target/universal-apple-darwin/release/bundle/...
+  build-windows:
+    name: windows lint + tests + installer + smoke
+    runs-on: windows-latest
+    needs: [core-test, typegen-check]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with: { version: 12.14.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: static export (tauri's generate_context! needs apps/desktop/out to compile the shell)
+        run: pnpm --filter desktop build:web
+      - name: clippy (whole workspace incl. the Tauri shell, ODBC and platform/windows.rs)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests (ODBC driver manager, ConPTY tunnel, Windows keyring backend)
+        env: { BULKDB_CREDENTIALS: memory }
+        run: cargo test -p bulk-core -p bulk-cli
+      - run: cargo build --release -p bulk-cli
+      - name: smoke (SQLite -> CSV 10k rows, byte-compared against the committed reference)
+        run: node scripts/smoke.mjs --cli target/release/bulk-cli.exe
+      # No TAURI_SIGNING_* here: the updater is off (see the note above the release job).
+      - run: pnpm --filter desktop build
+      - name: installer size gate (20 MB)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if (-not $exe) { throw "no NSIS installer under target/release/bundle/nsis" }
+          if ($exe.Length -gt 20MB) { throw "installer is $([math]::Round($exe.Length/1MB,1)) MB > 20 MB" }
+          Write-Output "$($exe.Name): $([math]::Round($exe.Length/1MB,1)) MB"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/bundle/**
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS lint + tests + universal + smoke
+    runs-on: macos-latest
+    needs: [core-test, typegen-check]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml + both Apple targets for the universal build
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with: { version: 12.14.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: static export (tauri's generate_context! needs apps/desktop/out to compile the shell)
+        run: pnpm --filter desktop build:web
+      - name: clippy (whole workspace incl. the Tauri shell and platform/macos.rs)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests (PTY tunnel, macOS keyring backend)
+        env: { BULKDB_CREDENTIALS: memory }
+        run: cargo test -p bulk-core -p bulk-cli
+      - run: cargo build --release -p bulk-cli
+      - run: node scripts/smoke.mjs --cli target/release/bulk-cli
+      # Apple code signing and notarization only; no TAURI_SIGNING_* because the updater is off
+      # (see the note above the release job).
+      - run: pnpm --filter desktop exec tauri build --target universal-apple-darwin
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: dmg size gate (30 MB)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmgs=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          [ "${#dmgs[@]}" -gt 0 ] || { echo "no dmg under target/universal-apple-darwin/release/bundle/dmg"; exit 1; }
+          f="${dmgs[0]}"
+          s=$(stat -f%z "$f")
+          echo "$f: $s bytes"
+          [ "$s" -le $((30*1024*1024)) ] || { echo "dmg is $s bytes > 30 MB"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: target/universal-apple-darwin/release/bundle/**
+          if-no-files-found: error
+
+  # Releases ship the installers only. The in-app updater is off: tauri.conf.json sets
+  # `bundle.createUpdaterArtifacts: false` and the shell does not use tauri-plugin-updater, so
+  # the builds above produce no `.sig` files, and `tauri build` never writes a `latest.json`
+  # update manifest in any configuration. To turn the updater on later, all of this together
+  # (the `updater_artifacts_are_all_or_nothing` test in apps/desktop/src-tauri/src/lib.rs
+  # enforces the first three):
+  #   1. tauri.conf.json: `bundle.createUpdaterArtifacts: true` and `plugins.updater` with the
+  #      `pubkey` printed by `pnpm --filter desktop exec tauri signer generate` plus `endpoints`
+  #      (e.g. https://github.com/<owner>/<repo>/releases/latest/download/latest.json);
+  #   2. add tauri-plugin-updater to the shell (Cargo.toml + `.plugin(...)` in lib.rs) and grant
+  #      `updater:default` in capabilities/default.json;
+  #   3. pass TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD (repository
+  #      secrets holding the generated private key) to the two bundle steps above;
+  #   4. here, write latest.json from the uploaded `.sig` files (version, notes, pub_date and a
+  #      `platforms` entry per target with the asset URL and the signature's contents), or
+  #      build with tauri-apps/tauri-action, which writes and uploads it;
+  #   5. add the updater payloads and their `.sig` files to `files` below (Windows: the setup
+  #      .exe / .msi themselves, or `.nsis.zip` / `.msi.zip` in "v1Compatible" mode; macOS: the
+  #      `.app.tar.gz`), together with latest.json.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          # A tag without all three installers is a broken release: fail instead of publishing.
+          fail_on_unmatched_files: true
+          files: |
+            windows/**/*.exe
+            windows/**/*.msi
+            macos/**/*.dmg

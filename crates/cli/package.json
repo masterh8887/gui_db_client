@@ -1,0 +1,9 @@
+{
+  "name": "bulk-cli",
+  "private": true,
+  "scripts": {
+    "build": "cargo build -p bulk-cli --release",
+    "lint": "cargo clippy -p bulk-cli --all-targets -- -D warnings",
+    "test": "cargo test -p bulk-cli"
+  }
+}

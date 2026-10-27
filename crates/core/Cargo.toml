@@ -1,0 +1,76 @@
+[package]
+name = "bulk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BulkDB core: streaming DB-to-file extraction engine (no UI, no Tauri)"
+
+[lib]
+name = "bulk_core"
+path = "src/lib.rs"
+
+[features]
+default = ["postgres", "mysql", "mssql", "sqlite", "odbc"]
+postgres = ["dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]
+mysql = ["dep:mysql_async"]
+mssql = ["dep:tiberius"]
+sqlite = []            # rusqlite is always linked (history.sqlite needs it)
+odbc = ["dep:odbc-api"] # build.rs only enables the `has_odbc` cfg on Windows (or BULKDB_ODBC=1)
+oracle = ["dep:oracle"]
+ts-export = []          # `cargo test --features ts-export export_bindings` regenerates packages/ipc-types
+it = []                 # integration tests that need docker databases
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+csv = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+tokio-postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
+tiberius = { workspace = true, optional = true }
+rusqlite = { workspace = true }
+oracle = { version = "0.6", optional = true }
+keyring = { workspace = true }
+libloading = { workspace = true }
+portable-pty = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+thiserror = { workspace = true }
+ts-rs = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }
+fs4 = { workspace = true }
+memory-stats = { workspace = true }
+glob = { workspace = true }
+rand = { workspace = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+odbc-api = { workspace = true, optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+odbc-api = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+
+[[bench]]
+name = "pipeline"
+harness = false

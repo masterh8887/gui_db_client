@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+# data
+arrow = { version = "56", default-features = false, features = ["csv"] }
+arrow-array = "56"
+arrow-schema = "56"
+parquet = { version = "56", default-features = false, features = ["arrow", "zstd", "snap", "async"] }
+csv = "1"
+flate2 = "1"
+zstd = "0.13"
+# drivers (tier 1)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+mysql_async = "0.36"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rust_decimal", "native-tls", "winauth"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+# drivers (tier 2)
+odbc-api = "13"
+# services
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+libloading = "0.8"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+thiserror = "2"
+anyhow = "1"
+# no-serde-warnings: ts-rs 10 cannot parse `skip_serializing_if`; the TS side is expressed by
+# `#[ts(optional)]`, so ignoring it is correct and the 238 warnings are noise.
+ts-rs = { version = "10", features = ["serde-compat", "chrono-impl", "no-serde-warnings"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+dirs = "6"
+fs4 = "0.13"
+memory-stats = "1"
+glob = "0.3"
+tempfile = "3"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.dev.package."*"]
+opt-level = 1

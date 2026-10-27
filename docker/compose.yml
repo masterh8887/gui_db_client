@@ -1,0 +1,44 @@
+# Integration-test databases: `docker compose -f docker/compose.yml up -d`, then
+#   BULKDB_PG_URL=postgres://bulkdb:bulkdb@127.0.0.1:5432/bulkdb \
+#   BULKDB_MYSQL_URL=mysql://root:bulkdb@127.0.0.1:3306/bulkdb \
+#   BULKDB_MSSQL_URL="mssql://sa:BulkDb%21Passw0rd@127.0.0.1:1433/master" \
+#   cargo test -p bulk-core --features it
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: bulkdb
+      POSTGRES_PASSWORD: bulkdb
+      POSTGRES_DB: bulkdb
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "work_mem=4MB"]
+    ports: ["5432:5432"]
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: bulkdb
+      MYSQL_DATABASE: bulkdb
+    ports: ["3306:3306"]
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "BulkDb!Passw0rd"
+    ports: ["1433:1433"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'BulkDb!Passw0rd' -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 10s
+      start_period: 20s
+      retries: 20
+  sshd:
+    # Tunnel tests: `ssh -p 2222 tester@127.0.0.1` (password: tester)
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      USER_NAME: tester
+      USER_PASSWORD: tester
+      PASSWORD_ACCESS: "true"
+      SUDO_ACCESS: "false"
+      DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel
+    ports: ["2222:2222"]
