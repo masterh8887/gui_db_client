@@ -71,7 +71,7 @@ fn small_batch(first_row: u64, rows: u64) -> RecordBatch {
 }
 
 fn stream_of(items: Vec<Result<Batch>>) -> SourceStream {
-    SourceStream { schema: Some(narrow_batcher().schema()), stream: stream::iter(items).boxed() }
+    SourceStream { schema: Some(narrow_batcher().schema()), stream: stream::iter(items).boxed(), replaced: None }
 }
 
 /// What an endless fake source reports about itself.
@@ -108,7 +108,7 @@ fn endless_stream(source: Arc<SourceState>, written: Arc<SinkState>, cancel: Can
             Some((Ok(Batch::Arrow(batch)), i + 1))
         }
     });
-    SourceStream { schema: Some(narrow_batcher().schema()), stream: s.boxed() }
+    SourceStream { schema: Some(narrow_batcher().schema()), stream: s.boxed(), replaced: None }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -162,7 +162,12 @@ impl Sink for CountingSink {
 
     fn finish(self: Box<Self>) -> Result<SinkReport> {
         self.state.finished.store(true, Ordering::SeqCst);
-        Ok(SinkReport { rows: self.state.rows.load(Ordering::SeqCst), bytes: self.state.bytes.load(Ordering::SeqCst), files: vec![PathBuf::from("fake.csv")] })
+        Ok(SinkReport {
+            rows: self.state.rows.load(Ordering::SeqCst),
+            bytes: self.state.bytes.load(Ordering::SeqCst),
+            files: vec![PathBuf::from("fake.csv")],
+            unmappable_chars: 0,
+        })
     }
 
     fn abort(self: Box<Self>) -> Vec<PathBuf> {
@@ -239,7 +244,7 @@ async fn empty_stream_finishes_with_zero_rows() {
 #[tokio::test]
 async fn empty_stream_without_schema_writes_no_batch() {
     let state = Arc::new(SinkState::default());
-    let stream = SourceStream { schema: None, stream: stream::iter(Vec::<Result<Batch>>::new()).boxed() };
+    let stream = SourceStream { schema: None, stream: stream::iter(Vec::<Result<Batch>>::new()).boxed(), replaced: None };
     let report = run_pipeline(stream, CountingSink::new(state.clone()), Arc::new(Progress::new()), CancellationToken::new()).await.unwrap();
     assert_eq!(report.rows, 0);
     assert!(state.finished.load(Ordering::SeqCst));
@@ -304,7 +309,7 @@ async fn cancel_polls_a_waiting_source_so_it_can_cancel_on_the_server() {
             }
         }
     });
-    let stream = SourceStream { schema: Some(narrow_batcher().schema()), stream: s.boxed() };
+    let stream = SourceStream { schema: Some(narrow_batcher().schema()), stream: s.boxed(), replaced: None };
     let state = Arc::new(SinkState::default());
     let task = tokio::spawn(run_pipeline(stream, CountingSink::new(state.clone()), Arc::new(Progress::new()), cancel.clone()));
 
@@ -323,7 +328,7 @@ async fn cancel_polls_a_waiting_source_so_it_can_cancel_on_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_while_source_is_pending() {
-    let stream = SourceStream { schema: None, stream: stream::pending().boxed() };
+    let stream = SourceStream { schema: None, stream: stream::pending().boxed(), replaced: None };
     let state = Arc::new(SinkState::default());
     let progress = Arc::new(Progress::new());
     let cancel = CancellationToken::new();
@@ -433,7 +438,7 @@ async fn export_sqlite(dir: &Path, sql: &str, opts: OutputOpts) -> SinkReport {
     let db_path = dir.join("fixture.db");
     testdata::sqlite_fixture(&db_path, 0, 100, 0).unwrap();
     let db = SqliteDatabase::connect(&sqlite_params(&db_path)).await.unwrap();
-    let query = Query { sql: sql.to_string(), output: StreamOutput::Arrow };
+    let query = Query { sql: sql.to_string(), output: StreamOutput::Arrow, max_batch_bytes: None };
     let cancel = CancellationToken::new();
     let stream = db.stream(&query, &SessionOpts::default(), cancel.clone()).await.unwrap();
     assert!(stream.schema.is_some(), "the SQLite source announces its schema up front");
@@ -447,7 +452,7 @@ async fn export_sqlite(dir: &Path, sql: &str, opts: OutputOpts) -> SinkReport {
 fn csv_output(split: Option<SplitOpts>) -> OutputOpts {
     OutputOpts {
         format: OutputFormat::Csv,
-        csv: Some(CsvOpts { header: true, delimiter: ",".into(), null_as: String::new(), bom: false, crlf: false }),
+        csv: Some(CsvOpts { header: true, delimiter: ",".into(), null_as: String::new(), bom: false, crlf: false, encoding: None }),
         split,
         ..OutputOpts::default()
     }

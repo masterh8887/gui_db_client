@@ -7,6 +7,13 @@
 //!
 //! Fixture tables are prefixed `bulkdb_it_` and recreated by every test, so the tests can run
 //! in parallel against one database.
+//!
+//! `BULKDB_MYSQL55_URL` (e.g. `mysql://root:bulkdb@127.0.0.1:3307/bulkdb`) enables the legacy
+//! suite at the end of this file: a `mysql:5.5` server started with
+//! `--character-set-server=euckr --collation-server=euckr_korean_ci --old-passwords=1
+//! --secure-auth=0` (see `docker/compose.yml` and the CI workflow). It covers old-password
+//! accounts, EUC-KR data (also CP949 stored in latin1 columns), tabular EXPLAIN, `KILL QUERY`
+//! versus `KILL`, and the `SHOW`-based catalog that MySQL 4.x gets.
 #![cfg(feature = "it")]
 
 use std::collections::BTreeMap;
@@ -14,10 +21,14 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{Array, BinaryArray, Date32Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
+use bulk_core::catalog::mysql::generic;
 use bulk_core::catalog::Catalog;
+use bulk_core::encoding::Charset;
 use bulk_core::monitor::{JobHandle, Monitor};
 use bulk_core::source::mysql::{Flavor, MySqlDatabase};
-use bulk_core::source::{Batch, ConnectParams, Query, Source, SslMode, StreamOutput};
+use bulk_core::source::mysql_common::MysqlRawQuery;
+use bulk_core::source::mysql_dispatch::TextPlan;
+use bulk_core::source::{open, Batch, ConnectParams, Query, Source, SslMode, StreamOutput};
 use bulk_core::testdata::{self, Lcg};
 use bulk_core::types::{SessionOpts, TableKind, TableRef};
 use bulk_core::{CancellationToken, CoreError, BATCH_ROWS};
@@ -44,6 +55,12 @@ fn target() -> Option<Target> {
     if url.is_empty() {
         return None;
     }
+    Some(parse_target(&url))
+}
+
+/// Parse `mysql://user:password@host:port/database[?...]`.
+fn parse_target(url: &str) -> Target {
+    let url = url.to_string();
     let rest = url.strip_prefix("mysql://").or_else(|| url.strip_prefix("mariadb://")).unwrap_or(&url);
     let (creds, rest) = match rest.rfind('@') {
         Some(at) => (Some(&rest[..at]), &rest[at + 1..]),
@@ -62,8 +79,8 @@ fn target() -> Option<Target> {
         None => (hostport.to_string(), 3306),
     };
     let database = path.split('?').next().unwrap_or("").to_string();
-    assert!(!database.is_empty(), "BULKDB_MYSQL_URL must name a database: mysql://user:pass@host:port/database");
-    Some(Target { url, host, port, user, password, database })
+    assert!(!database.is_empty(), "the MySQL test URL must name a database: mysql://user:pass@host:port/database");
+    Target { url, host, port, user, password, database }
 }
 
 macro_rules! require_server {
@@ -104,7 +121,7 @@ async fn admin(t: &Target) -> mysql_async::Conn {
 }
 
 fn query(sql: &str) -> Query {
-    Query { sql: sql.to_string(), output: StreamOutput::Arrow }
+    Query { sql: sql.to_string(), output: StreamOutput::Arrow, max_batch_bytes: None }
 }
 
 fn table(t: &Target, name: &str) -> TableRef {
@@ -373,6 +390,50 @@ async fn cancel_kills_the_server_query() {
     adm.query_drop("DROP TABLE IF EXISTS `bulkdb_it_cancel`").await.unwrap();
 }
 
+/// Wait until connection `id` no longer runs a statement (gone or `Sleep`), at most `secs`.
+async fn wait_not_running(adm: &mut mysql_async::Conn, id: u32, secs: u64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match command_of(adm, id).await {
+            None => return,
+            Some(cmd) if cmd == "Sleep" => return,
+            Some(cmd) => {
+                assert!(Instant::now() < deadline, "connection {id} still '{cmd}' {secs} s after {what}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// The consumer goes away while the server is slow to produce the next (or the first) row: the
+/// reader task must kill the query instead of waiting for that row.
+#[tokio::test]
+async fn dropped_consumer_kills_a_slow_query() {
+    let t = require_server!();
+    let mut adm = admin(&t).await;
+    create_nasty(&mut adm, "bulkdb_it_dropped", 3_000).await;
+
+    // Mid-result: rows flow in primary-key order (`text` is in no index), then the server
+    // sleeps 60 s on row 2900.
+    let db = connect(&t, "bulkdb-it-dropped").await;
+    let id = session_id_of(&db);
+    let opts = SessionOpts { fetch_batch_rows: Some(100), ..Default::default() };
+    let sql = "SELECT id, text, SLEEP(IF(id = 2900, 60, 0)) AS s FROM bulkdb_it_dropped";
+    let out = db.stream(&query(sql), &opts, CancellationToken::new()).await.unwrap();
+    let mut stream = out.stream;
+    assert!(matches!(stream.next().await, Some(Ok(Batch::Arrow(_)))));
+    drop(stream);
+    wait_not_running(&mut adm, id, 10, "the stream was dropped").await;
+
+    // Before the first row: the caller gives up on `stream()` while the server is busy.
+    let db = connect(&t, "bulkdb-it-dropped-2").await;
+    let id = session_id_of(&db);
+    let started = tokio::time::timeout(Duration::from_millis(500), db.stream(&query("SELECT SLEEP(60)"), &SessionOpts::default(), CancellationToken::new())).await;
+    assert!(started.is_err(), "the server is still sleeping");
+    wait_not_running(&mut adm, id, 10, "stream() was dropped").await;
+    adm.query_drop("DROP TABLE IF EXISTS `bulkdb_it_dropped`").await.unwrap();
+}
+
 /// mysql_async always negotiates CLIENT_MULTI_STATEMENTS, so the driver must never let text
 /// after a `;` run: extraction is a prepared statement (one statement only) and EXPLAIN is
 /// checked lexically. The extraction session is read only on top of that.
@@ -460,6 +521,16 @@ async fn probe_session_and_explain() {
         assert_eq!(info.ram_source.as_deref(), Some("innodb_buffer_pool_size x 1.33"));
     }
     assert!(info.notes.iter().any(|n| n.starts_with("MySQL") || n.starts_with("MariaDB")));
+    assert_eq!(info.settings.get("protocol").map(String::as_str), Some("modern"));
+    assert!(info.settings.get("text_plan").is_some_and(|p| p.contains("SET NAMES")), "{:?}", info.settings.get("text_plan"));
+    // protocol = auto reaches a 4.1+ server through the greeting check; legacy refuses it.
+    let mut auto = params(&t, "bulkdb-it-auto");
+    auto.fields.insert("protocol".into(), "auto".into());
+    let via_auto = open(&auto).await.expect("protocol=auto connects to a 4.1+ server");
+    assert_eq!(via_auto.probe().await.unwrap().settings.get("protocol").map(String::as_str), Some("modern"));
+    let mut legacy = params(&t, "bulkdb-it-legacy");
+    legacy.fields.insert("protocol".into(), "legacy".into());
+    assert!(matches!(open(&legacy).await.err(), Some(CoreError::Connect(_))), "protocol=legacy refuses a 4.1+ server");
 
     db.apply_session(&SessionOpts { statement_timeout_ms: Some(120_000), work_mem: Some("64MB".into()), lock_timeout_ms: Some(5_000), ..Default::default() })
         .await
@@ -709,4 +780,347 @@ async fn monitor_finds_and_cancels_the_session() {
     let gone = JobHandle { session_id: Some("4294967295".into()), ..handle };
     assert!(!monitor.snapshot(&gone).await.unwrap().found);
     adm.query_drop("DROP TABLE IF EXISTS `bulkdb_it_mon`").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Legacy MySQL 5.5 (BULKDB_MYSQL55_URL): EUC-KR server, pre-4.1 password hashes
+// ---------------------------------------------------------------------------------------------
+//
+// The CI container runs `mysql:5.5 --character-set-server=euckr --collation-server=euckr_korean_ci
+// --old-passwords=1 --secure-auth=0`, so the fixture database defaults to euckr and root has a
+// pre-4.1 hash: every connection of this suite sets `allow_old_password=true` unless a test is
+// about that toggle. Fixture objects are prefixed `bulkdb_it55_`.
+
+/// `BULKDB_MYSQL55_URL` parsed like `BULKDB_MYSQL_URL`, or `None`.
+fn target55() -> Option<Target> {
+    let url = std::env::var("BULKDB_MYSQL55_URL").ok()?.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    Some(parse_target(&url))
+}
+
+macro_rules! require_server55 {
+    () => {
+        match target55() {
+            Some(t) => t,
+            None => {
+                eprintln!("skipping: BULKDB_MYSQL55_URL is not set");
+                return;
+            }
+        }
+    };
+}
+
+/// Connection parameters for the 5.5 server with extra `--field`s (old passwords allowed by
+/// default because root has a pre-4.1 hash).
+fn params55(t: &Target, application_name: &str, fields: &[(&str, &str)]) -> ConnectParams {
+    let mut p = params(t, application_name);
+    p.fields.insert("allow_old_password".into(), "true".into());
+    for (k, v) in fields {
+        p.fields.insert(k.to_string(), v.to_string());
+    }
+    p
+}
+
+async fn connect55(t: &Target, application_name: &str, fields: &[(&str, &str)]) -> MySqlDatabase {
+    MySqlDatabase::connect(&params55(t, application_name, fields)).await.expect("connect to mysql:5.5")
+}
+
+/// Admin connection to the 5.5 server (`secure_auth(false)`: root has an old hash).
+async fn admin55(t: &Target) -> mysql_async::Conn {
+    let opts = mysql_async::Opts::from_url(&t.url).expect("BULKDB_MYSQL55_URL is a valid mysql:// URL");
+    mysql_async::Conn::new(mysql_async::OptsBuilder::from_opts(opts).secure_auth(false)).await.expect("admin connection to mysql:5.5")
+}
+
+/// Every string cell of column `col` over all batches.
+fn strings(batches: &[arrow_array::RecordBatch], col: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        let a = b.column(col).as_any().downcast_ref::<StringArray>().expect("a string column");
+        out.extend((0..a.len()).map(|i| a.value(i).to_string()));
+    }
+    out
+}
+
+const HANGUL_CP949: &str = "X'C7D1B1DB'"; // "한글" in CP949 / EUC-KR
+
+#[tokio::test]
+async fn mysql55_old_password_account_needs_the_toggle() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    for (user, old) in [("bulkdb_it55_old", 1), ("bulkdb_it55_new", 0)] {
+        let _ = adm.query_drop(format!("DROP USER '{user}'@'%'")).await;
+        adm.query_drop(format!("SET SESSION old_passwords = {old}")).await.unwrap();
+        adm.query_drop(format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'pw-{user}'")).await.unwrap();
+        adm.query_drop(format!("GRANT SELECT ON `{}`.* TO '{user}'@'%'", t.database)).await.unwrap();
+    }
+    let len: Option<u64> = adm.query_first("SELECT LENGTH(Password) FROM mysql.user WHERE User = 'bulkdb_it55_old'").await.unwrap();
+    assert_eq!(len, Some(16), "old_passwords = 1 stores a pre-4.1 hash");
+
+    let as_user = |user: &str, fields: &[(&str, &str)]| {
+        let mut p = params(&t, "bulkdb-it55-auth");
+        p.user = Some(user.to_string());
+        p.password = Some(format!("pw-{user}"));
+        for (k, v) in fields {
+            p.fields.insert(k.to_string(), v.to_string());
+        }
+        p
+    };
+    // protocol = auto: the greeting is 4.1+, so mysql_async connects; the old hash needs the toggle.
+    match open(&as_user("bulkdb_it55_old", &[("protocol", "auto")])).await {
+        Err(CoreError::Auth(msg)) => assert!(msg.contains("allow_old_password"), "the error names the toggle: {msg}"),
+        Err(other) => panic!("expected AUTH for an old-password account without the toggle, got {other:?}"),
+        Ok(_) => panic!("an old-password account must not log in without allow_old_password"),
+    }
+    let db = open(&as_user("bulkdb_it55_old", &[("protocol", "auto"), ("allow_old_password", "true")])).await.expect("old-password login with the toggle");
+    let info = db.probe().await.unwrap();
+    assert_eq!(info.settings.get("protocol").map(String::as_str), Some("modern"));
+    assert!(info.version.starts_with("5.5"));
+    // A 4.1-hash account never needs the toggle.
+    open(&as_user("bulkdb_it55_new", &[("protocol", "modern")])).await.expect("new-hash login");
+
+    for user in ["bulkdb_it55_old", "bulkdb_it55_new"] {
+        let _ = adm.query_drop(format!("DROP USER '{user}'@'%'")).await;
+    }
+}
+
+#[tokio::test]
+async fn mysql55_legacy_protocol_is_refused() {
+    let t = require_server55!();
+    match open(&params55(&t, "bulkdb-it55-legacy", &[("protocol", "legacy")])).await {
+        Err(CoreError::Connect(msg)) => assert!(msg.contains("auto") || msg.contains("modern"), "{msg}"),
+        Err(other) => panic!("protocol=legacy against 5.5 must be CONNECT, got {other:?}"),
+        Ok(_) => panic!("protocol=legacy must refuse a 4.1+ server"),
+    }
+    match open(&params55(&t, "bulkdb-it55-legacy", &[("protocol", "v3")])).await {
+        Err(CoreError::Invalid(_)) => {}
+        other => panic!("an unknown protocol value is INVALID, got {:?}", other.err()),
+    }
+}
+
+#[tokio::test]
+async fn mysql55_euckr_and_latin1_tables_read_as_korean() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_euckr").await.unwrap();
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_latin1").await.unwrap();
+    adm.query_drop("CREATE TABLE bulkdb_it55_euckr (id INT PRIMARY KEY, name VARCHAR(20)) DEFAULT CHARSET=euckr").await.unwrap();
+    adm.query_drop("CREATE TABLE bulkdb_it55_latin1 (id INT PRIMARY KEY, name VARCHAR(20)) DEFAULT CHARSET=latin1").await.unwrap();
+    // The legacy setup: CP949 bytes in a latin1 column, as an old application wrote them.
+    adm.query_drop(format!("INSERT INTO bulkdb_it55_euckr VALUES (1, _euckr {HANGUL_CP949}), (2, 'abc')")).await.unwrap();
+    adm.query_drop(format!("INSERT INTO bulkdb_it55_latin1 VALUES (1, _latin1 {HANGUL_CP949}), (2, 'abc')")).await.unwrap();
+
+    // encoding = euc-kr: no server-side conversion, each column decoded by its collation.
+    let db = connect55(&t, "bulkdb-it55-euc", &[("encoding", "euc-kr")]).await;
+    assert_eq!(db.text_plan(), &TextPlan::PassThrough { client: "euckr", legacy: Charset::EucKr }, "the fixture database defaults to euckr");
+    for table in ["bulkdb_it55_euckr", "bulkdb_it55_latin1"] {
+        let (batches, rows, err) = drain(&db, &format!("SELECT name FROM {table} ORDER BY id"), CancellationToken::new()).await;
+        assert!(err.is_none(), "{table}: {err:?}");
+        assert_eq!(rows, 2);
+        assert_eq!(strings(&batches, 0), ["한글", "abc"], "{table} under encoding=euc-kr");
+    }
+    // A Korean literal and alias are encoded as EUC-KR on the way in.
+    let (batches, rows, err) = drain(&db, "SELECT id AS 번호, name FROM bulkdb_it55_euckr WHERE name = '한글'", CancellationToken::new()).await;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(rows, 1);
+    assert_eq!(batches[0].schema().field(0).name(), "번호");
+    // A character EUC-KR cannot represent is refused before it reaches the server.
+    match db.stream(&query("SELECT '😀' AS x"), &SessionOpts::default(), CancellationToken::new()).await {
+        Err(CoreError::Invalid(_)) => {}
+        Err(other) => panic!("an unrepresentable literal must be INVALID, got {other:?}"),
+        Ok(_) => panic!("an unrepresentable literal must be refused"),
+    }
+
+    // encoding = auto: the server converts; the euckr column is right, the latin1 one is the
+    // familiar mojibake (and the probe suggests euc-kr when the default charset is latin1).
+    let auto = connect55(&t, "bulkdb-it55-auto", &[]).await;
+    assert_eq!(auto.text_plan(), &TextPlan::ServerUtf8 { names: "utf8mb4" });
+    let (batches, _, err) = drain(&auto, "SELECT name FROM bulkdb_it55_euckr ORDER BY id", CancellationToken::new()).await;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(strings(&batches, 0), ["한글", "abc"]);
+    let (batches, _, err) = drain(&auto, "SELECT name FROM bulkdb_it55_latin1 ORDER BY id", CancellationToken::new()).await;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(strings(&batches, 0), ["ÇÑ±Û", "abc"]);
+
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_euckr").await.unwrap();
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_latin1").await.unwrap();
+}
+
+/// A latin1 database (the classic Korean 4.x / 5.x setup): the client charset is latin1, so a
+/// Korean literal compares byte-for-byte with the CP949 stored in latin1 columns, and names /
+/// comments double-encoded in the data dictionary are repaired.
+#[tokio::test]
+async fn mysql55_latin1_database_holding_cp949() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    adm.query_drop("DROP DATABASE IF EXISTS bulkdb_it55_l1").await.unwrap();
+    adm.query_drop("CREATE DATABASE bulkdb_it55_l1 DEFAULT CHARACTER SET latin1").await.unwrap();
+    // Sent through a latin1 connection as raw CP949 bytes, exactly like the legacy application.
+    adm.query_drop("SET NAMES latin1").await.unwrap();
+    let mut ddl = b"CREATE TABLE bulkdb_it55_l1.member (id INT PRIMARY KEY, name VARCHAR(20)) DEFAULT CHARSET=latin1 COMMENT='".to_vec();
+    ddl.extend_from_slice(&[0xC7, 0xD1, 0xB1, 0xDB]);
+    ddl.push(b'\'');
+    adm.query_drop(ddl.as_slice()).await.unwrap();
+    adm.query_drop(format!("INSERT INTO bulkdb_it55_l1.member VALUES (1, {HANGUL_CP949}), (2, 'abc')")).await.unwrap();
+
+    let mut p = params55(&t, "bulkdb-it55-l1", &[("encoding", "euc-kr")]);
+    p.database = Some("bulkdb_it55_l1".into());
+    let db = MySqlDatabase::connect(&p).await.expect("connect to the latin1 database");
+    assert_eq!(db.text_plan(), &TextPlan::PassThrough { client: "latin1", legacy: Charset::EucKr });
+    let (batches, rows, err) = drain(&db, "SELECT name FROM member WHERE name = '한글'", CancellationToken::new()).await;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(rows, 1);
+    assert_eq!(strings(&batches, 0), ["한글"]);
+
+    let tables = db.tables("bulkdb_it55_l1", "bulkdb_it55_l1").await.unwrap();
+    let member = tables.iter().find(|x| x.name == "member").expect("member is listed");
+    assert_eq!(member.comment.as_deref(), Some("한글"), "the double-encoded comment is repaired");
+    let probe = db.probe().await.unwrap();
+    assert!(probe.settings.get("text_plan").is_some_and(|p| p.contains("latin1")), "{:?}", probe.settings.get("text_plan"));
+
+    adm.query_drop("DROP DATABASE IF EXISTS bulkdb_it55_l1").await.unwrap();
+}
+
+#[tokio::test]
+async fn mysql55_probe_session_and_tabular_explain() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    create_nasty(&mut adm, "bulkdb_it55_probe", 1_000).await;
+
+    let db = connect55(&t, "bulkdb-it55-probe", &[]).await;
+    assert!(!db.facts().caps.explain_json && !db.facts().caps.read_only_tx && db.facts().caps.kill_query);
+    let info = db.probe().await.unwrap();
+    assert_eq!(info.settings.get("protocol").map(String::as_str), Some("modern"));
+    assert_eq!(info.settings.get("character_set_server").map(String::as_str), Some("euckr"));
+    assert!(info.settings.get("text_plan").is_some_and(|p| p.contains("utf8mb4")));
+    assert!(info.notes.iter().any(|n| n.contains("no statement timeout")), "{:?}", info.notes);
+    assert_eq!(info.can_write, Some(true));
+
+    // No READ ONLY session and no statement timeout on 5.5: both are skipped, not errors.
+    db.apply_session(&SessionOpts { statement_timeout_ms: Some(60_000), ..Default::default() }).await.unwrap();
+
+    let plan = db.explain("SELECT id, note FROM bulkdb_it55_probe WHERE id < 10 ORDER BY note", false).await.unwrap().expect("a plan");
+    assert_eq!(plan.raw_format, "text");
+    assert!(plan.raw.starts_with("id\tselect_type\ttable"), "{}", plan.raw);
+    assert!(plan.root.is_some());
+    assert!(plan.tables.iter().any(|r| r.name == "bulkdb_it55_probe"), "{:?}", plan.tables);
+    assert!(plan.estimated_rows.is_some());
+    // 5.5 would run a derived table to explain it: refused instead.
+    assert!(matches!(db.explain("SELECT * FROM (SELECT id FROM bulkdb_it55_probe) d", false).await, Err(CoreError::Invalid(_))));
+    assert!(matches!(db.explain("SELECT 1", true).await, Err(CoreError::Invalid(_))));
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_probe").await.unwrap();
+}
+
+/// 5.5 has `KILL QUERY`: a cancelled count leaves the session alive. A `KILL <id>` (what 4.x
+/// cancels do) ends it, and the next call reconnects on its own.
+#[tokio::test]
+async fn mysql55_kill_query_keeps_the_session_and_kill_reconnects() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    create_nasty(&mut adm, "bulkdb_it55_kill", 3_000).await;
+    adm.query_drop("DROP VIEW IF EXISTS bulkdb_it55_slow").await.unwrap();
+    adm.query_drop("CREATE VIEW bulkdb_it55_slow AS SELECT a.id FROM bulkdb_it55_kill a, bulkdb_it55_kill b, bulkdb_it55_kill c").await.unwrap();
+
+    let db = connect55(&t, "bulkdb-it55-kill", &[]).await;
+    let id = session_id_of(&db);
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        trigger.cancel();
+    });
+    let started = Instant::now();
+    let r = db.exact_count(&table(&t, "bulkdb_it55_slow"), cancel).await;
+    assert!(matches!(r, Err(CoreError::Cancelled)), "got {r:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "cancel took {:?}", started.elapsed());
+    // KILL QUERY: same session, still usable.
+    assert_eq!(db.exact_count(&table(&t, "bulkdb_it55_kill"), CancellationToken::new()).await.unwrap(), 3_000);
+    assert_eq!(session_id_of(&db), id);
+
+    // A whole-session KILL from outside: the next metadata call reconnects transparently.
+    adm.query_drop(format!("KILL {id}")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let first = db.tables(&t.database, &t.database).await;
+    let tables = match first {
+        Ok(tables) => tables,
+        // The call that discovers the dead socket fails with CONNECT; the next one reconnects.
+        Err(CoreError::Connect(_)) => db.tables(&t.database, &t.database).await.expect("reconnected"),
+        Err(other) => panic!("unexpected error after KILL: {other:?}"),
+    };
+    assert!(tables.iter().any(|x| x.name == "bulkdb_it55_kill"));
+    assert_ne!(session_id_of(&db), id, "a new connection after KILL");
+
+    // Streaming cancel ends with Cancelled via KILL QUERY.
+    let cancel = CancellationToken::new();
+    let out = db.stream(&query("SELECT a.id, b.id FROM bulkdb_it55_kill a, bulkdb_it55_kill b"), &SessionOpts::default(), cancel.clone()).await.unwrap();
+    let mut stream = out.stream;
+    assert!(matches!(stream.next().await, Some(Ok(Batch::Arrow(_)))));
+    cancel.cancel();
+    let mut terminal = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            terminal = Some(e);
+            break;
+        }
+    }
+    assert!(matches!(terminal, Some(CoreError::Cancelled)), "got {terminal:?}");
+
+    adm.query_drop("DROP VIEW IF EXISTS bulkdb_it55_slow").await.unwrap();
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_kill").await.unwrap();
+}
+
+/// The `SHOW`-based catalog (what 4.0 / 4.1 get) agrees with `information_schema` on 5.5.
+#[tokio::test]
+async fn mysql55_show_catalog_matches_information_schema() {
+    let t = require_server55!();
+    let mut adm = admin55(&t).await;
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_cat").await.unwrap();
+    adm.query_drop(
+        "CREATE TABLE bulkdb_it55_cat (\
+            id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+            code VARCHAR(10) NOT NULL COMMENT 'business key', \
+            label VARCHAR(40) NULL DEFAULT 'none', \
+            UNIQUE KEY uq_code (code), \
+            KEY ix_label (label(8))\
+         ) ENGINE=InnoDB COMMENT='catalog fixture'",
+    )
+    .await
+    .unwrap();
+    adm.query_drop("INSERT INTO bulkdb_it55_cat (code, label) VALUES ('a', 'x'), ('b', NULL)").await.unwrap();
+
+    let db = connect55(&t, "bulkdb-it55-cat", &[]).await;
+    let tref = table(&t, "bulkdb_it55_cat");
+
+    let is_tables = generic::tables(&db, &t.database, &t.database).await.unwrap();
+    let show_tables = generic::show::tables(&db, &t.database).await.unwrap();
+    // Other tests create and drop tables in parallel: compare the fixture, not whole listings.
+    let listed = is_tables.iter().find(|x| x.name == "bulkdb_it55_cat").expect("information_schema lists the fixture");
+    let shown = show_tables.iter().find(|x| x.name == "bulkdb_it55_cat").expect("SHOW TABLE STATUS lists the fixture");
+    assert_eq!((shown.kind, &shown.comment), (listed.kind, &listed.comment));
+    assert_eq!(shown.kind, TableKind::Table);
+    assert_eq!(shown.comment.as_deref(), Some("catalog fixture"), "InnoDB notes are stripped");
+    assert!(shown.estimated_rows.is_some() && shown.table_bytes.is_some());
+
+    let is_cols = generic::columns(&db, &tref).await.unwrap();
+    let show_cols = generic::show::columns(&db, &tref).await.unwrap();
+    let sig = |c: &bulk_core::types::ColumnInfo| (c.position, c.name.clone(), c.data_type.to_lowercase(), c.nullable, c.primary_key, c.unique, c.comment.clone());
+    assert_eq!(show_cols.iter().map(sig).collect::<Vec<_>>(), is_cols.iter().map(sig).collect::<Vec<_>>());
+    assert_eq!(show_cols[1].comment.as_deref(), Some("business key"));
+
+    let is_ix = generic::indexes(&db, &tref).await.unwrap();
+    let show_ix = generic::show::indexes(&db, &tref).await.unwrap();
+    let isig = |i: &bulk_core::types::IndexInfo| (i.name.clone(), i.primary, i.unique, i.columns.clone(), i.kind.clone(), i.definition.clone());
+    assert_eq!(show_ix.iter().map(isig).collect::<Vec<_>>(), is_ix.iter().map(isig).collect::<Vec<_>>());
+    assert_eq!(show_ix[0].name, "PRIMARY");
+    assert!(show_ix.iter().any(|i| i.columns == ["label(8)"]));
+
+    let schemas = generic::show::schemas(&db, &t.database).await.unwrap();
+    assert!(schemas[0].table_count.unwrap_or(0) >= 1);
+    assert!(matches!(generic::show::schemas(&db, "bulkdb_no_such_db_xyz").await, Err(CoreError::NotFound(_))));
+    assert!(matches!(generic::show::columns(&db, &table(&t, "bulkdb_it55_missing")).await, Err(CoreError::NotFound(_))));
+    let dbs = generic::show::databases(&db).await.unwrap();
+    assert!(dbs.iter().any(|d| d.name == t.database && d.is_current));
+
+    adm.query_drop("DROP TABLE IF EXISTS bulkdb_it55_cat").await.unwrap();
 }

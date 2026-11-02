@@ -4,9 +4,11 @@ import type { HostKeyPrompt } from "./HostKeyPrompt";
 import type { JobDone } from "./JobDone";
 import type { JobStateEvent } from "./JobStateEvent";
 import type { LogEvent } from "./LogEvent";
+import type { PromptResolved } from "./PromptResolved";
+import type { Settings } from "./Settings";
 import type { SshPasswordPrompt } from "./SshPasswordPrompt";
 
 /**
  * Events pushed from core to the shell. Progress is *not* an event: it is polled.
  */
-export type CoreEvent = { "type": "job_state" } & JobStateEvent | { "type": "job_done" } & JobDone | { "type": "job_log" } & LogEvent | { "type": "tunnel_host_key" } & HostKeyPrompt | { "type": "tunnel_password" } & SshPasswordPrompt | { "type": "drivers_changed" } & Array<DriverInfo>;
+export type CoreEvent = { "type": "job_state" } & JobStateEvent | { "type": "job_done" } & JobDone | { "type": "job_log" } & LogEvent | { "type": "tunnel_host_key" } & HostKeyPrompt | { "type": "tunnel_password" } & SshPasswordPrompt | { "type": "drivers_changed" } & Array<DriverInfo> | { "type": "connections_changed" } | { "type": "settings_changed" } & Settings | { "type": "prompt_resolved" } & PromptResolved;

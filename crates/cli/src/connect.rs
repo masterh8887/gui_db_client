@@ -200,6 +200,7 @@ pub fn build_connection(adhoc: &AdhocConn, name: &str, drivers: &[DriverInfo]) -
     Ok(Connection {
         id: String::new(),
         name: name.to_string(),
+        tag: None,
         driver: driver.to_string(),
         host: adhoc.host.clone(),
         port,
@@ -212,6 +213,10 @@ pub fn build_connection(adhoc: &AdhocConn, name: &str, drivers: &[DriverInfo]) -
         save_password: true,
         has_password: false,
         has_ssh_secret: false,
+        // A new connection never starts write-allowed (docs/db-copy.md 2).
+        write_allowed: None,
+        // Computed on read; an ad-hoc connection carries no session password.
+        has_session_password: None,
     })
 }
 
@@ -229,6 +234,11 @@ pub fn apply_edit(existing: &Connection, a: &ConnEditArgs, drivers: &[DriverInfo
     let mut c = existing.clone();
     if let Some(name) = &a.name {
         c.name = non_blank(name).ok_or_else(|| anyhow!("--name must not be empty"))?;
+    }
+    if a.clear_tag {
+        c.tag = None;
+    } else if let Some(tag) = a.tag {
+        c.tag = Some(tag.into());
     }
     if let Some(driver) = &ad.driver {
         let driver = driver.trim();
@@ -379,6 +389,7 @@ mod tests {
                 install_hint: None,
                 fields: vec!["host".into(), "password".into()],
                 defaults: [("port".to_string(), "5432".to_string())].into_iter().collect(),
+                choices: None,
                 session_opts: vec![],
                 odbc_drivers: vec![],
                 library_path: None,
@@ -394,6 +405,7 @@ mod tests {
                 install_hint: None,
                 fields: vec!["path".into()],
                 defaults: BTreeMap::new(),
+                choices: None,
                 session_opts: vec![],
                 odbc_drivers: vec![],
                 library_path: None,
@@ -501,6 +513,24 @@ mod tests {
         assert!(!new.save_password);
         assert!(apply_edit(&old, &edit_args(&["--name", ""]), &drivers()).is_err());
         assert!(apply_edit(&old, &edit_args(&["--field", "password=x"]), &drivers()).is_err());
+    }
+
+    #[test]
+    fn edit_sets_keeps_and_clears_the_tag() {
+        use bulk_core::types::ConnTag;
+        let old = saved_pg();
+        assert_eq!(old.tag, None, "build_connection leaves the tag to the caller");
+        let tagged = apply_edit(&old, &edit_args(&["--tag", "prod"]), &drivers()).unwrap();
+        assert_eq!(tagged.tag, Some(ConnTag::Production));
+        assert_eq!(Connection { tag: None, ..tagged.clone() }, old, "only the tag changed");
+        // Other edits keep the tag.
+        let moved = apply_edit(&tagged, &edit_args(&["--host", "db9"]), &drivers()).unwrap();
+        assert_eq!(moved.tag, Some(ConnTag::Production));
+        assert_eq!(apply_edit(&tagged, &edit_args(&[]), &drivers()).unwrap(), tagged);
+        // Retag and clear.
+        assert_eq!(apply_edit(&tagged, &edit_args(&["--tag", "staging"]), &drivers()).unwrap().tag, Some(ConnTag::Staging));
+        assert_eq!(apply_edit(&tagged, &edit_args(&["--clear-tag"]), &drivers()).unwrap().tag, None);
+        assert_eq!(apply_edit(&old, &edit_args(&["--clear-tag"]), &drivers()).unwrap(), old, "clearing an untagged connection changes nothing");
     }
 
     #[test]

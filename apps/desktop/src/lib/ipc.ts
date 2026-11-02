@@ -12,6 +12,7 @@
 
 import { invoke as tauriInvoke, isTauri } from '@tauri-apps/api/core';
 import { listen as tauriListen, type UnlistenFn } from '@tauri-apps/api/event';
+import { useSyncExternalStore } from 'react';
 import { toIpcError } from './ipc-error';
 
 type MockModule = typeof import('./mock-ipc');
@@ -31,6 +32,13 @@ export function inTauri(): boolean {
   } catch {
     return false;
   }
+}
+
+const noSubscribe = () => () => {};
+
+/** `inTauri()` for render code (prerendered as `false`, so hydration matches the HTML). */
+export function useInTauri(): boolean {
+  return useSyncExternalStore(noSubscribe, inTauri, () => false);
 }
 
 /** Deep-copy `v` replacing every `bigint` with a `number` (JSON cannot carry bigint). */
@@ -67,4 +75,24 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
 export async function listen<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
   if (!inTauri()) return (await mock()).mockListen<T>(event, handler);
   return tauriListen<T>(event, (e) => handler(e.payload));
+}
+
+/** Label of the window this code runs in (`main` outside Tauri). */
+export async function currentWindowLabel(): Promise<string> {
+  if (!inTauri()) return 'main';
+  const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+  return getCurrentWebviewWindow().label;
+}
+
+/**
+ * Listen to a window-targeted event (`menu:action`, `tunnel:hostkey`, `tunnel:password`,
+ * `jobs:claimed`, `app:quit-requested`; docs/db-copy.md 1.1). Tauri also delivers an `emit_to`
+ * to listeners registered with the default target `{ kind: 'Any' }`, which would run it in every
+ * window, so these are only ever subscribed with this window as the target. In mock mode: the
+ * mock's per-window bus.
+ */
+export async function listenWindow<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
+  if (!inTauri()) return (await mock()).mockListenWindow<T>('main', event, handler);
+  const label = await currentWindowLabel();
+  return tauriListen<T>(event, (e) => handler(e.payload), { target: { kind: 'WebviewWindow', label } });
 }

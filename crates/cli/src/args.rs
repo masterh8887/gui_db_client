@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use bulk_core::types::{Compression, OutputFormat, ParquetCompression, SshAuth};
+use bulk_core::types::{Compression, ConnTag, OutputFormat, ParquetCompression, SshAuth};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use crate::output::parse_duration_ms;
@@ -18,9 +18,19 @@ Connections:
   deleted again when the command finishes (its password goes to the credential store and is
   removed with it); pass --save <NAME> to keep it as a saved connection.
 
+  MySQL fields (also on `conn add` / `conn edit`; `drivers --json` lists their choices):
+    protocol=auto|modern|legacy   auto reads the server greeting: MySQL 3.23 / 4.0 (pre-4.1)
+                                  uses the built-in legacy client, 4.1+ and MariaDB mysql_async
+    encoding=auto|utf8|euc-kr|latin1
+                                  what the stored text is; euc-kr (CP949) also reads Korean
+                                  stored in latin1 columns, without server-side conversion
+    allow_old_password=true       accept accounts with pre-4.1 OLD_PASSWORD() hashes (weaker)
+  Output encoding is separate: `export --encoding euc-kr` writes a CP949 CSV.
+
 Exit codes:
   0 done   1 failed / error   2 cancelled (Ctrl+C)   3 rejected by preflight (or by `check`)
-  4 preflight warnings need acknowledgement (re-run with --yes)
+  4 preflight warnings need acknowledgement (re-run with --yes) or a confirmation is missing
+  5 copy: the job failed or ended with problems (a stored, resumable result exists)
 
 Environment:
   BULKDB_CONFIG_DIR     config directory (same as --config-dir)
@@ -74,6 +84,9 @@ pub enum Cmd {
     /// Write a support bundle (logs, settings, connection definitions without secrets, driver
     /// detection) to a zip file.
     Diagnostics(DiagnosticsArgs),
+    /// Copy the schemas, tables and data of a database into another database of the same
+    /// family (postgres, mysql, sqlite), converting character sets on the way.
+    Copy(crate::args_copy::CopyArgs),
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -120,7 +133,9 @@ pub struct AdhocConn {
     #[arg(long, value_name = "FILE", help_heading = "Ad-hoc connection")]
     pub path: Option<PathBuf>,
     /// Driver specific field, repeatable: sslmode=require, instance=SQLEXPRESS,
-    /// service_name=ORCL, driver="ODBC Driver 18 for SQL Server", connection_string=...
+    /// service_name=ORCL, driver="ODBC Driver 18 for SQL Server", connection_string=...;
+    /// MySQL: protocol=auto|modern|legacy (legacy = MySQL 3.23 / 4.0),
+    /// encoding=auto|utf8|euc-kr|latin1, allow_old_password=true (pre-4.1 password hashes)
     #[arg(long = "field", value_name = "KEY=VALUE", value_parser = parse_key_val, help_heading = "Ad-hoc connection")]
     pub fields: Vec<(String, String)>,
     /// SSH bastion host (enables the tunnel).
@@ -167,6 +182,32 @@ impl From<SshAuthArg> for SshAuth {
     }
 }
 
+/// `--tag`: the connection's environment (the names are the config / JSON values).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagArg {
+    Local,
+    #[value(alias = "dev")]
+    Development,
+    #[value(alias = "test")]
+    Testing,
+    #[value(alias = "stage")]
+    Staging,
+    #[value(alias = "prod")]
+    Production,
+}
+
+impl From<TagArg> for ConnTag {
+    fn from(a: TagArg) -> Self {
+        match a {
+            TagArg::Local => ConnTag::Local,
+            TagArg::Development => ConnTag::Development,
+            TagArg::Testing => ConnTag::Testing,
+            TagArg::Staging => ConnTag::Staging,
+            TagArg::Production => ConnTag::Production,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // export
 // ---------------------------------------------------------------------------------------------
@@ -201,6 +242,26 @@ impl CompressArg {
             CompressArg::Gzip => Some(Compression::Gzip),
             CompressArg::Zstd => Some(Compression::Zstd),
             CompressArg::NoCompression => None,
+        }
+    }
+}
+
+/// `export --encoding`: CSV output text encoding.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingArg {
+    /// UTF-8 (default).
+    #[value(name = "utf-8", alias = "utf8")]
+    Utf8,
+    /// CP949 / UHC, a superset of EUC-KR (Korean Windows / Excel "ANSI").
+    #[value(name = "euc-kr", alias = "euckr", alias = "cp949")]
+    EucKr,
+}
+
+impl EncodingArg {
+    pub fn to_core(self) -> bulk_core::types::CsvEncoding {
+        match self {
+            EncodingArg::Utf8 => bulk_core::types::CsvEncoding::Utf8,
+            EncodingArg::EucKr => bulk_core::types::CsvEncoding::EucKr,
         }
     }
 }
@@ -267,9 +328,15 @@ pub struct ExportArgs {
     /// Text written for NULL (default: empty).
     #[arg(long, value_name = "TEXT", help_heading = "CSV")]
     pub null: Option<String>,
-    /// Write a UTF-8 byte order mark (Excel).
+    /// Write a UTF-8 byte order mark (Excel). UTF-8 only: an error with --encoding euc-kr.
     #[arg(long, help_heading = "CSV")]
     pub bom: bool,
+    /// Text encoding of the CSV file: utf-8 (default) or euc-kr (CP949, Korean Excel).
+    /// No BOM is written for euc-kr (--excel then just skips it; --bom with euc-kr is an
+    /// error); characters EUC-KR cannot represent are written as '?' and counted in the
+    /// result notes. Parquet is always UTF-8.
+    #[arg(long, value_enum, value_name = "ENCODING", help_heading = "CSV")]
+    pub encoding: Option<EncodingArg>,
     /// CRLF line endings (default: the platform setting; CRLF on Windows).
     #[arg(long, conflicts_with = "lf", help_heading = "CSV")]
     pub crlf: bool,
@@ -279,7 +346,7 @@ pub struct ExportArgs {
     /// Compress the CSV stream (default: from the --out extension).
     #[arg(long, value_enum, value_name = "CODEC", help_heading = "CSV")]
     pub compress: Option<CompressArg>,
-    /// Excel preset: split every 1,000,000 rows, BOM, CRLF.
+    /// Excel preset: split every 1,000,000 rows, BOM, CRLF (no BOM with --encoding euc-kr).
     #[arg(long, help_heading = "CSV")]
     pub excel: bool,
 
@@ -569,13 +636,24 @@ pub struct ConnAddArgs {
     pub name: String,
     #[command(flatten)]
     pub adhoc: AdhocConn,
+    /// Environment tag shown next to the connection (production is red in the app).
+    /// With --replace and no --tag, the replaced connection's tag is kept.
+    #[arg(long, value_enum, value_name = "TAG")]
+    pub tag: Option<TagArg>,
     /// Ask for the password every time instead of storing it.
     #[arg(long)]
     pub no_save_password: bool,
     /// When a connection with this name exists, replace its definition with these flags
-    /// (keeping its id, history and session defaults) instead of failing.
+    /// (keeping its id, history, session defaults and tag) instead of failing.
     #[arg(long)]
     pub replace: bool,
+    /// Allow DB copy to write into this connection (`bulk-cli copy` targets only). A
+    /// production-tagged connection asks on a terminal, or needs --yes.
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+    pub write_allowed: Option<bool>,
+    /// Confirm --write-allowed true on a production-tagged connection without asking.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// `conn edit`: every flag is optional and only what is given changes.
@@ -591,6 +669,12 @@ pub struct ConnEditArgs {
     /// value (`--host ""`) clears host, database or user.
     #[command(flatten)]
     pub adhoc: AdhocConn,
+    /// Set the environment tag.
+    #[arg(long, value_enum, value_name = "TAG", help_heading = "Edit")]
+    pub tag: Option<TagArg>,
+    /// Remove the environment tag (the connection becomes untagged).
+    #[arg(long, conflicts_with = "tag", help_heading = "Edit")]
+    pub clear_tag: bool,
     /// Remove a driver specific field, repeatable.
     #[arg(long = "unset-field", value_name = "KEY", help_heading = "Edit")]
     pub unset_fields: Vec<String>,
@@ -623,6 +707,14 @@ pub struct ConnEditArgs {
     /// Delete the stored SSH password / key passphrase; the database password stays.
     #[arg(long, conflicts_with_all = ["ssh_password_env", "ssh_passphrase_env"], help_heading = "Edit")]
     pub clear_ssh_secret: bool,
+    /// Allow (true) or forbid (false) DB copy to write into this connection. Pointing the
+    /// connection at another server clears it unless the same edit sends true. A
+    /// production-tagged connection asks on a terminal, or needs --yes.
+    #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set, help_heading = "Edit")]
+    pub write_allowed: Option<bool>,
+    /// Confirm --write-allowed true on a production-tagged connection without asking.
+    #[arg(long, help_heading = "Edit")]
+    pub yes: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -789,6 +881,49 @@ mod tests {
         // The other secret can still be replaced in the same edit.
         assert!(Cli::try_parse_from(["bulk-cli", "conn", "edit", "prod", "--clear-password", "--ssh-password-env", "S"]).is_ok());
         assert!(Cli::try_parse_from(["bulk-cli", "conn", "edit", "prod", "--clear-ssh-secret", "--password-env", "PW"]).is_ok());
+    }
+
+    #[test]
+    fn conn_tag_flags() {
+        let add = |extra: &[&str]| {
+            let mut argv = vec!["bulk-cli", "conn", "add", "--name", "p", "--driver", "sqlite", "--path", "a.db"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Cmd::Conn(ConnArgs { cmd: ConnCmd::Add(a) }) = add(&["--tag", "production"]).unwrap().cmd else { panic!("expected conn add") };
+        assert_eq!(a.tag, Some(TagArg::Production));
+        let Cmd::Conn(ConnArgs { cmd: ConnCmd::Add(a) }) = add(&[]).unwrap().cmd else { panic!() };
+        assert_eq!(a.tag, None);
+        // Short spellings are aliases of the config names.
+        for (alias, tag) in [("prod", TagArg::Production), ("dev", TagArg::Development), ("test", TagArg::Testing), ("stage", TagArg::Staging), ("local", TagArg::Local)]
+        {
+            let Cmd::Conn(ConnArgs { cmd: ConnCmd::Add(a) }) = add(&["--tag", alias]).unwrap().cmd else { panic!() };
+            assert_eq!(a.tag, Some(tag), "{alias}");
+        }
+        assert!(add(&["--tag", "qa"]).is_err());
+        assert!(add(&["--tag"]).is_err());
+        assert!(add(&["--clear-tag"]).is_err(), "add has nothing to clear");
+
+        let edit = |extra: &[&str]| {
+            let mut argv = vec!["bulk-cli", "conn", "edit", "prod"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let Cmd::Conn(ConnArgs { cmd: ConnCmd::Edit(e) }) = edit(&["--tag", "staging"]).unwrap().cmd else { panic!("expected conn edit") };
+        assert_eq!((e.tag, e.clear_tag), (Some(TagArg::Staging), false));
+        let Cmd::Conn(ConnArgs { cmd: ConnCmd::Edit(e) }) = edit(&["--clear-tag"]).unwrap().cmd else { panic!() };
+        assert_eq!((e.tag, e.clear_tag), (None, true));
+        let Cmd::Conn(ConnArgs { cmd: ConnCmd::Edit(e) }) = edit(&[]).unwrap().cmd else { panic!() };
+        assert_eq!((e.tag, e.clear_tag), (None, false));
+        assert!(edit(&["--tag", "local", "--clear-tag"]).is_err(), "setting and clearing contradict");
+
+        assert_eq!(ConnTag::from(TagArg::Production), ConnTag::Production);
+        assert_eq!(ConnTag::from(TagArg::Local), ConnTag::Local);
+        // Every core tag has a flag value spelled exactly like its config value.
+        for tag in ConnTag::ALL {
+            let arg = TagArg::from_str(tag.as_str(), false).unwrap();
+            assert_eq!(ConnTag::from(arg), tag);
+        }
     }
 
     #[test]

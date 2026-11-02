@@ -1,78 +1,508 @@
 @import 'tailwindcss';
 
-/* Desktop density: 13px base, 28px rows, tight spacing. */
+/*
+ * BulkDB design tokens (apps/desktop/DESIGN.md §3). Components never use hex values: they use
+ * these custom properties, through the Tailwind names mapped in `@theme inline` below
+ * (`bg-window`, `text-fg-secondary`, `border-separator`, `shadow-popover`, ...).
+ *
+ * Dark values live under the `prefers-color-scheme` media query (unless the user forced light)
+ * and under `[data-theme='dark']` (same values). Windows overrides (`data-platform`, set by the
+ * AppShell from `lib/platform`) only touch the toolbar colour, which matches the Win11 caption.
+ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #1a1a1a;
-  --muted: #f4f4f5;
-  --muted-foreground: #6b7280;
-  --border: #e4e4e7;
-  --accent: #2563eb;
-  --accent-foreground: #ffffff;
-  --danger: #dc2626;
-  --warning: #d97706;
-  --success: #16a34a;
-  --row-height: 28px;
+  /* surfaces */
+  --bg-window: #ffffff;
+  --bg-sidebar: #f5f5f6;
+  --bg-toolbar: #efeff0;
+  --bg-tabbar: #e4e4e6;
+  --bg-panel: #fafafa;
+  --bg-elevated: #ffffff;
+  --bg-input: #ffffff;
+  --border-input: rgba(0, 0, 0, 0.15);
+  --bg-control: rgba(0, 0, 0, 0.05);
+  --btn-bg: #ffffff;
+  --btn-bg-hover: #f7f7f8;
+  --btn-bg-pressed: #ededee;
+  --btn-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.16), 0 1px 1px rgba(0, 0, 0, 0.06);
+  --seg-thumb: #ffffff;
+  --seg-thumb-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.1);
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-pressed: rgba(0, 0, 0, 0.08);
+  --bg-selected: rgba(0, 0, 0, 0.08);
+  --bg-selected-focus: var(--accent-fill);
+  --separator: rgba(0, 0, 0, 0.08);
+  --separator-strong: rgba(0, 0, 0, 0.15);
+
+  /* text */
+  --fg: #1d1d1f;
+  --fg-secondary: #636366;
+  --fg-tertiary: #86868b;
+  --fg-on-accent: #ffffff;
+  --fg-on-accent-muted: rgba(255, 255, 255, 0.85);
+
+  /* accent and states */
+  --accent: #1f6feb;
+  --accent-hover: #1a5fd0;
+  --accent-fill: #1f6feb;
+  --accent-fill-hover: #1a5fd0;
+  --accent-soft: rgba(31, 111, 235, 0.12);
+  --danger: #d92d20;
+  --danger-soft: rgba(217, 45, 32, 0.1);
+  /* fills under white text (>= 4.5:1); --accent-hover / --danger stay text colours */
+  --danger-fill: #d92d20;
+  --danger-fill-hover: #b42318;
+  --warning: #b26a00;
+  --warning-soft: rgba(230, 140, 0, 0.12);
+  --success: #157f3c;
+  --success-soft: rgba(21, 127, 60, 0.1);
+  --focus: rgba(31, 111, 235, 0.55);
+  --ring-input: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+
+  /* environment tags: -fill carries white text (>= 4.5:1), the plain token is for dots / text */
+  --env-local-fill: #6e6e73;
+  --env-development-fill: #2b7a3b;
+  --env-testing-fill: #6741d9;
+  --env-staging-fill: #c2410c;
+  --env-production-fill: #c92a2a;
+  --env-local: var(--env-local-fill);
+  --env-development: var(--env-development-fill);
+  --env-testing: var(--env-testing-fill);
+  --env-staging: var(--env-staging-fill);
+  --env-production: var(--env-production-fill);
+  --env-local-soft: color-mix(in srgb, var(--env-local) 14%, transparent);
+  --env-development-soft: color-mix(in srgb, var(--env-development) 14%, transparent);
+  --env-testing-soft: color-mix(in srgb, var(--env-testing) 14%, transparent);
+  --env-staging-soft: color-mix(in srgb, var(--env-staging) 14%, transparent);
+  --env-production-soft: color-mix(in srgb, var(--env-production) 14%, transparent);
+
+  /* elevation */
+  --elev-popover: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 6px 20px rgba(0, 0, 0, 0.12);
+  --elev-dialog: 0 0 0 0.5px rgba(0, 0, 0, 0.14), 0 18px 50px rgba(0, 0, 0, 0.22);
+  --scrim: rgba(0, 0, 0, 0.18);
+
+  /* SQL syntax (Xcode-like); the SqlEditor theme uses only these */
+  --syn-keyword: #9b2393;
+  --syn-string: #c41a16;
+  --syn-number: #1c00cf;
+  --syn-comment: #6c7986;
+  --syn-type: #3900a0;
+  --syn-function: #326d74;
+  --syn-variable: #643820;
+  --syn-selection: rgba(31, 111, 235, 0.2);
+
+  /* sizes (use as h-(--h-bar)) */
+  --h-toolbar: 40px;
+  --h-tabbar: 30px;
+  --h-bar: 28px;
+  --h-row: 26px;
+  --h-row-sm: 24px;
+  --h-row-2: 44px;
+  --h-control: 26px;
+  --h-control-sm: 22px;
+  --w-sidebar: 240px;
+  --w-inspector: 300px;
+  /* top edge of sheets: 48px in a workspace, 16px on Welcome (AppShell sets it) */
+  --sheet-top: 48px;
+
+  /* legacy names (unmigrated components, deleted in wave W3) */
+  --background: var(--bg-window);
+  --foreground: var(--fg);
+  --muted: var(--bg-panel);
+  --muted-foreground: var(--fg-secondary);
+  --border: var(--separator);
+  --accent-foreground: var(--fg-on-accent);
+  --row-height: var(--h-row);
+
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --background: #141518;
-    --foreground: #e6e6e6;
-    --muted: #1e2024;
-    --muted-foreground: #9ca3af;
-    --border: #2b2e34;
-    --accent: #3b82f6;
-    --accent-foreground: #ffffff;
-    --danger: #ef4444;
-    --warning: #f59e0b;
-    --success: #22c55e;
+    --bg-window: #1e1e20;
+    --bg-sidebar: #252528;
+    --bg-toolbar: #2a2a2d;
+    --bg-tabbar: #1b1b1d;
+    --bg-panel: #222225;
+    --bg-elevated: #2c2c30;
+    --bg-input: rgba(255, 255, 255, 0.05);
+    --border-input: rgba(255, 255, 255, 0.12);
+    --bg-control: rgba(255, 255, 255, 0.07);
+    --btn-bg: rgba(255, 255, 255, 0.1);
+    --btn-bg-hover: rgba(255, 255, 255, 0.14);
+    --btn-bg-pressed: rgba(255, 255, 255, 0.07);
+    --btn-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+    --seg-thumb: rgba(255, 255, 255, 0.16);
+    --seg-thumb-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+    --bg-hover: rgba(255, 255, 255, 0.055);
+    --bg-pressed: rgba(255, 255, 255, 0.09);
+    --bg-selected: rgba(255, 255, 255, 0.1);
+    --separator: rgba(255, 255, 255, 0.08);
+    --separator-strong: rgba(255, 255, 255, 0.15);
+    --fg: #e9e9eb;
+    --fg-secondary: #a1a1a6;
+    --fg-tertiary: #7c7c82;
+    --accent: #4c8dff;
+    --accent-hover: #6ea2ff;
+    --accent-fill: #2f6fe0;
+    --accent-fill-hover: #2a63cc;
+    --accent-soft: rgba(76, 141, 255, 0.18);
+    --danger: #ff6b5f;
+    --danger-soft: rgba(255, 107, 95, 0.14);
+    --danger-fill: #d43a2f;
+    --danger-fill-hover: #b9302a;
+    --warning: #f5b041;
+    --warning-soft: rgba(245, 176, 65, 0.14);
+    --success: #4cc38a;
+    --success-soft: rgba(76, 195, 138, 0.14);
+    --focus: rgba(76, 141, 255, 0.6);
+    --env-local: #98989d;
+    --env-development: #51cf66;
+    --env-testing: #9775fa;
+    --env-staging: #ff922b;
+    --env-production: #ff6b6b;
+    --elev-popover: 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 8px 24px rgba(0, 0, 0, 0.45);
+    --elev-dialog: 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 20px 60px rgba(0, 0, 0, 0.55);
+    --scrim: rgba(0, 0, 0, 0.35);
+    --syn-keyword: #fc5fa3;
+    --syn-string: #fc6a5d;
+    --syn-number: #d0bf69;
+    --syn-comment: #7f8c98;
+    --syn-type: #a167e6;
+    --syn-function: #67b7a4;
+    --syn-variable: #ffa14f;
+    --syn-selection: rgba(76, 141, 255, 0.32);
     color-scheme: dark;
+  }
+  :root[data-platform='windows']:not([data-theme='light']) {
+    --bg-toolbar: #202020;
   }
 }
 
 :root[data-theme='dark'] {
-  --background: #141518;
-  --foreground: #e6e6e6;
-  --muted: #1e2024;
-  --muted-foreground: #9ca3af;
-  --border: #2b2e34;
-  --accent: #3b82f6;
-  --accent-foreground: #ffffff;
-  --danger: #ef4444;
-  --warning: #f59e0b;
-  --success: #22c55e;
+  --bg-window: #1e1e20;
+  --bg-sidebar: #252528;
+  --bg-toolbar: #2a2a2d;
+  --bg-tabbar: #1b1b1d;
+  --bg-panel: #222225;
+  --bg-elevated: #2c2c30;
+  --bg-input: rgba(255, 255, 255, 0.05);
+  --border-input: rgba(255, 255, 255, 0.12);
+  --bg-control: rgba(255, 255, 255, 0.07);
+  --btn-bg: rgba(255, 255, 255, 0.1);
+  --btn-bg-hover: rgba(255, 255, 255, 0.14);
+  --btn-bg-pressed: rgba(255, 255, 255, 0.07);
+  --btn-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --seg-thumb: rgba(255, 255, 255, 0.16);
+  --seg-thumb-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --bg-hover: rgba(255, 255, 255, 0.055);
+  --bg-pressed: rgba(255, 255, 255, 0.09);
+  --bg-selected: rgba(255, 255, 255, 0.1);
+  --separator: rgba(255, 255, 255, 0.08);
+  --separator-strong: rgba(255, 255, 255, 0.15);
+  --fg: #e9e9eb;
+  --fg-secondary: #a1a1a6;
+  --fg-tertiary: #7c7c82;
+  --accent: #4c8dff;
+  --accent-hover: #6ea2ff;
+  --accent-fill: #2f6fe0;
+  --accent-fill-hover: #2a63cc;
+  --accent-soft: rgba(76, 141, 255, 0.18);
+  --danger: #ff6b5f;
+  --danger-soft: rgba(255, 107, 95, 0.14);
+  --danger-fill: #d43a2f;
+  --danger-fill-hover: #b9302a;
+  --warning: #f5b041;
+  --warning-soft: rgba(245, 176, 65, 0.14);
+  --success: #4cc38a;
+  --success-soft: rgba(76, 195, 138, 0.14);
+  --focus: rgba(76, 141, 255, 0.6);
+  --env-local: #98989d;
+  --env-development: #51cf66;
+  --env-testing: #9775fa;
+  --env-staging: #ff922b;
+  --env-production: #ff6b6b;
+  --elev-popover: 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 8px 24px rgba(0, 0, 0, 0.45);
+  --elev-dialog: 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 20px 60px rgba(0, 0, 0, 0.55);
+  --scrim: rgba(0, 0, 0, 0.35);
+  --syn-keyword: #fc5fa3;
+  --syn-string: #fc6a5d;
+  --syn-number: #d0bf69;
+  --syn-comment: #7f8c98;
+  --syn-type: #a167e6;
+  --syn-function: #67b7a4;
+  --syn-variable: #ffa14f;
+  --syn-selection: rgba(76, 141, 255, 0.32);
   color-scheme: dark;
 }
 
+:root[data-platform='windows'] {
+  --bg-toolbar: #f3f3f3;
+}
+:root[data-platform='windows'][data-theme='dark'] {
+  --bg-toolbar: #202020;
+}
+
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-muted: var(--muted);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-border: var(--border);
+  --color-window: var(--bg-window);
+  --color-sidebar: var(--bg-sidebar);
+  --color-toolbar: var(--bg-toolbar);
+  --color-tabbar: var(--bg-tabbar);
+  --color-panel: var(--bg-panel);
+  --color-elevated: var(--bg-elevated);
+  --color-input: var(--bg-input);
+  --color-border-input: var(--border-input);
+  --color-control: var(--bg-control);
+  --color-btn: var(--btn-bg);
+  --color-btn-hover: var(--btn-bg-hover);
+  --color-btn-pressed: var(--btn-bg-pressed);
+  --color-seg-thumb: var(--seg-thumb);
+  --color-hover: var(--bg-hover);
+  --color-pressed: var(--bg-pressed);
+  --color-selected: var(--bg-selected);
+  --color-selected-focus: var(--bg-selected-focus);
+  --color-separator: var(--separator);
+  --color-separator-strong: var(--separator-strong);
+  --color-fg: var(--fg);
+  --color-fg-secondary: var(--fg-secondary);
+  --color-fg-tertiary: var(--fg-tertiary);
+  --color-on-accent: var(--fg-on-accent);
+  --color-on-accent-muted: var(--fg-on-accent-muted);
   --color-accent: var(--accent);
-  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fill: var(--accent-fill);
+  --color-accent-fill-hover: var(--accent-fill-hover);
+  --color-accent-soft: var(--accent-soft);
   --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-fill: var(--danger-fill);
+  --color-danger-fill-hover: var(--danger-fill-hover);
   --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
   --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-focus: var(--focus);
+  --color-env-local: var(--env-local);
+  --color-env-local-soft: var(--env-local-soft);
+  --color-env-local-fill: var(--env-local-fill);
+  --color-env-development: var(--env-development);
+  --color-env-development-soft: var(--env-development-soft);
+  --color-env-development-fill: var(--env-development-fill);
+  --color-env-testing: var(--env-testing);
+  --color-env-testing-soft: var(--env-testing-soft);
+  --color-env-testing-fill: var(--env-testing-fill);
+  --color-env-staging: var(--env-staging);
+  --color-env-staging-soft: var(--env-staging-soft);
+  --color-env-staging-fill: var(--env-staging-fill);
+  --color-env-production: var(--env-production);
+  --color-env-production-soft: var(--env-production-soft);
+  --color-env-production-fill: var(--env-production-fill);
+
+  /* legacy aliases, deleted in wave W3 */
+  --color-background: var(--bg-window);
+  --color-foreground: var(--fg);
+  --color-muted: var(--bg-panel);
+  --color-muted-foreground: var(--fg-secondary);
+  --color-border: var(--separator);
+  --color-accent-foreground: var(--fg-on-accent);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', system-ui, 'Apple SD Gothic Neo',
+    'Malgun Gothic', 'Noto Sans KR', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Cascadia Code', Consolas, 'D2Coding', 'Malgun Gothic', monospace;
+  --text-xs: 11px;
+  --text-xs--line-height: 14px;
+  --text-sm: 12px;
+  --text-sm--line-height: 16px;
+  --text-base: 13px;
+  --text-base--line-height: 18px;
+  --text-lg: 15px;
+  --text-lg--line-height: 20px;
+  --text-xl: 20px;
+  --text-xl--line-height: 26px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --shadow-popover: var(--elev-popover);
+  --shadow-dialog: var(--elev-dialog);
+  --shadow-btn: var(--btn-shadow);
+  --shadow-seg: var(--seg-thumb-shadow);
 }
 
-html,
-body {
-  font-size: 13px;
-  font-family:
-    -apple-system, 'Segoe UI', 'Malgun Gothic', 'Apple SD Gothic Neo', system-ui, sans-serif;
-  background: var(--background);
-  color: var(--foreground);
+/* ---- base (element defaults; in @layer base so Tailwind utilities can override them) ------ */
+
+@layer base {
+  /* The root font size stays at the browser default (16px): Tailwind's spacing scale is rem
+     based (`h-7` = 1.75rem = 28px), so a 13px root would shrink every control by 13/16.
+     The 13/18 body text is set on body. */
+  body {
+    font-size: 13px;
+    line-height: 18px;
+  }
+  html,
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg-window);
+    color: var(--fg);
+    /* Native chrome (DESIGN.md §3.3): nothing selectable that is not content. */
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+    overscroll-behavior: none;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Korean wraps between words, not inside them; a token too long for its line still breaks. */
+  body:lang(ko) {
+    word-break: keep-all;
+    overflow-wrap: break-word;
+  }
+
+  input,
+  textarea,
+  .cm-editor,
+  [data-selectable],
+  [data-selectable] * {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  img,
+  a {
+    -webkit-user-drag: none;
+  }
+
+  button,
+  [role='button'],
+  [role='tab'],
+  [role='option'],
+  [role='menuitem'],
+  [role='menuitemradio'],
+  [role='menuitemcheckbox'] {
+    cursor: default;
+  }
+
+  *,
+  ::before,
+  ::after {
+    border-color: var(--separator);
+  }
+
+  ::selection {
+    background: var(--syn-selection);
+  }
+
+  /* Focus: a ring on buttons, segmented controls and links; rows of roving-focus widgets draw
+     their own selection instead (outline none). Inputs use `.input-focus`. */
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 1px;
+  }
+  [role='option']:focus-visible,
+  [role='tab'][data-roving]:focus-visible,
+  [role='treeitem']:focus-visible,
+  [role='listbox']:focus-visible,
+  [role='tree']:focus-visible,
+  [role='row']:focus-visible,
+  [data-roving-list]:focus-visible {
+    outline: none;
+  }
 }
 
-* {
-  border-color: var(--border);
+/* ---- state rules (unlayered on purpose: they must win over the utilities they restyle) ----- */
+
+/* Inputs: accent border + 3px ring on focus, in both themes. */
+.input-focus:focus,
+.input-focus:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--ring-input);
+  outline: none;
 }
 
-/* Indeterminate progress bar (monitor cards). */
+/* Selection inside a focused list (`:focus-within` on the listbox): accent fill, white text;
+   secondary text and icons (`.sel-muted`) go muted-white. EnvTag chips keep their fill. */
+[role='listbox']:focus-within [aria-selected='true'],
+[data-roving-list]:focus-within [aria-selected='true'] {
+  background: var(--bg-selected-focus);
+  color: var(--fg-on-accent);
+}
+[role='listbox']:focus-within [aria-selected='true'] .sel-muted,
+[data-roving-list]:focus-within [aria-selected='true'] .sel-muted {
+  color: var(--fg-on-accent-muted);
+}
+
+@layer components {
+  /* Lists: no layout jump when the scrollbar appears. */
+  .list-scroll {
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ---- scrollbars: invisible until the container is hovered; 8px with a 2px inset ---------- */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  background: transparent;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+:hover::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--fg-tertiary) 45%, transparent);
+}
+
+/* ---- motion: 120ms enters, instant exits; none on rows, tabs or menu items --------------- */
+
+@keyframes bulk-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes bulk-enter-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes bulk-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-enter {
+  animation: bulk-enter 120ms ease-out;
+}
+.animate-enter-up {
+  animation: bulk-enter-up 120ms ease-out;
+}
+.animate-fade {
+  animation: bulk-fade 120ms ease-out;
+}
+
+/* Indeterminate progress (ProgressBar, pill line). */
 @keyframes slide {
   0% {
     left: -35%;
@@ -81,15 +511,16 @@ body {
     left: 100%;
   }
 }
-
-/* Native-feeling scrollbars in the WebView. */
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+.animate-indeterminate {
+  animation: slide 1.2s ease-in-out infinite;
 }
-::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--muted-foreground) 35%, transparent);
-  border-radius: 6px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

@@ -8,6 +8,9 @@ use ts_rs::TS;
 
 use crate::error::ErrorPayload;
 
+/// DB copy IPC and contract types (docs/db-copy.md section 2) live in `copy/types.rs`.
+pub use crate::copy::types::*;
+
 // ---------------------------------------------------------------------------------------------
 // Connections
 // ---------------------------------------------------------------------------------------------
@@ -19,6 +22,12 @@ use crate::error::ErrorPayload;
 pub struct Connection {
     pub id: String,
     pub name: String,
+    /// Environment tag shown next to the connection name everywhere (production in red).
+    /// Absent = untagged; configs written before the tag existed load unchanged.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<ConnTag>,
     /// Driver id from `drivers/registry.json` (`postgres`, `mysql`, `mssql`, `sqlite`, `odbc`, `oracle`).
     pub driver: String,
     #[serde(default)]
@@ -61,10 +70,73 @@ pub struct Connection {
     /// Computed on load: whether an SSH password / key passphrase is stored.
     #[serde(default)]
     pub has_ssh_secret: bool,
+    /// May be the target of a DB copy (docs/db-copy.md section 8). Stored only when
+    /// `Some(true)`; resolved by `ConfigStore::upsert`: absent keeps the stored value, `false`
+    /// clears, `true` sets only on an existing id; an endpoint change clears it unless the same
+    /// save sends `true`. Every other feature stays read-only on every connection.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_allowed: Option<bool>,
+    /// Computed on load: a password was typed this session for this "ask every time" connection
+    /// (core keeps it in memory, shared by every window; the secret itself never crosses IPC).
+    /// Absent when none, so a second window can skip asking for a password core already holds
+    /// (db-copy.md 1.1 / 7). Output only: never stored, like `has_password`.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_session_password: Option<bool>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Environment a connection points at. Purely informational for the core (nothing behaves
+/// differently per tag); the UI colours the connection by it and the CLI prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnTag {
+    Local,
+    Development,
+    Testing,
+    Staging,
+    Production,
+}
+
+impl ConnTag {
+    /// Every tag, from the least to the most sensitive environment.
+    pub const ALL: [ConnTag; 5] = [ConnTag::Local, ConnTag::Development, ConnTag::Testing, ConnTag::Staging, ConnTag::Production];
+
+    /// The wire / config spelling (`"production"`), identical to the serde value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnTag::Local => "local",
+            ConnTag::Development => "development",
+            ConnTag::Testing => "testing",
+            ConnTag::Staging => "staging",
+            ConnTag::Production => "production",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ConnTag {
+    type Err = String;
+
+    /// Exact tag names, case-insensitive (`Production`, `staging`).
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let t = s.trim();
+        ConnTag::ALL.into_iter().find(|tag| tag.as_str().eq_ignore_ascii_case(t)).ok_or_else(|| {
+            let names: Vec<&str> = ConnTag::ALL.iter().map(|t| t.as_str()).collect();
+            format!("unknown connection tag '{t}' (expected one of: {})", names.join(", "))
+        })
+    }
 }
 
 /// `conn_save` argument. Secrets ride along once and go straight to the keyring.
@@ -188,11 +260,20 @@ pub struct CsvOpts {
     /// Text written for NULL: `""`, `"NULL"`, `"\\N"`, ...
     #[serde(default)]
     pub null_as: String,
+    /// UTF-8 byte order mark. Only written when the encoding is UTF-8; ignored for EUC-KR
+    /// (see [`CsvOpts::writes_bom`]).
     #[serde(default)]
     pub bom: bool,
     /// CRLF line endings (default on Windows, off on macOS).
     #[serde(default)]
     pub crlf: bool,
+    /// Text encoding of the file; absent = UTF-8. `euc-kr` writes CP949 (a superset of
+    /// EUC-KR); characters it cannot represent are written as `?` and counted in the job
+    /// result notes. Parquet output is always UTF-8 and ignores this.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<CsvEncoding>,
 }
 
 fn default_delimiter() -> String {
@@ -201,7 +282,45 @@ fn default_delimiter() -> String {
 
 impl Default for CsvOpts {
     fn default() -> Self {
-        CsvOpts { header: true, delimiter: ",".into(), null_as: String::new(), bom: false, crlf: false }
+        CsvOpts { header: true, delimiter: ",".into(), null_as: String::new(), bom: false, crlf: false, encoding: None }
+    }
+}
+
+impl CsvOpts {
+    /// The encoding actually written (`None` = UTF-8).
+    pub fn effective_encoding(&self) -> CsvEncoding {
+        self.encoding.unwrap_or_default()
+    }
+
+    /// A BOM is written only for UTF-8 output.
+    pub fn writes_bom(&self) -> bool {
+        self.bom && self.effective_encoding() == CsvEncoding::Utf8
+    }
+}
+
+/// CSV output encoding. Wire values `"utf-8"` / `"euc-kr"`; `utf8`, `euckr` and `cp949` are
+/// accepted as aliases on input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+pub enum CsvEncoding {
+    #[default]
+    #[serde(rename = "utf-8")]
+    #[serde(alias = "utf8", alias = "UTF-8")]
+    #[ts(rename = "utf-8")]
+    Utf8,
+    /// CP949 / UHC (what Korean Windows and Excel call ANSI), a superset of EUC-KR.
+    #[serde(rename = "euc-kr")]
+    #[serde(alias = "euckr", alias = "cp949", alias = "EUC-KR")]
+    #[ts(rename = "euc-kr")]
+    EucKr,
+}
+
+impl CsvEncoding {
+    /// Wire value (`utf-8` / `euc-kr`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CsvEncoding::Utf8 => "utf-8",
+            CsvEncoding::EucKr => "euc-kr",
+        }
     }
 }
 
@@ -746,6 +865,8 @@ pub enum JobKind {
     Export,
     ExactCount,
     LocalOpen,
+    /// DB copy (docs/db-copy.md). `conn_id` / `conn_name` are the source.
+    Copy,
 }
 
 /// The nine-state machine from the spec.
@@ -918,6 +1039,11 @@ pub struct JobSummary {
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact_count: Option<ExactCount>,
+    /// Copy jobs only (`kind == copy`).
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy: Option<CopyJobInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -1079,6 +1205,13 @@ pub struct DriverInfo {
     pub fields: Vec<String>,
     #[serde(default)]
     pub defaults: BTreeMap<String, String>,
+    /// Allowed values of enumerated fields (registry `choices`), e.g. MySQL
+    /// `protocol: [auto, modern, legacy]`; the connection form renders these as a select.
+    /// Absent when the driver has no enumerated field.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<BTreeMap<String, Vec<String>>>,
     pub session_opts: Vec<String>,
     /// Installed ODBC driver names (ODBC tier only).
     #[serde(default)]
@@ -1100,6 +1233,16 @@ pub struct HostKeyPrompt {
     pub key_type: Option<String>,
     /// The raw ssh message, for the dialog.
     pub message: String,
+    /// Connection whose tunnel asks (context for prompts raised in another window).
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn_name: Option<String>,
+    /// Label of the job that opened the tunnel, when a job did.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -1110,6 +1253,76 @@ pub struct SshPasswordPrompt {
     pub user: String,
     /// `password` or `passphrase`.
     pub kind: String,
+    /// Connection whose tunnel asks (context for prompts raised in another window).
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn_name: Option<String>,
+    /// Label of the job that opened the tunnel, when a job did.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_label: Option<String>,
+}
+
+/// `prompt:resolved`: a tunnel prompt was answered, timed out or dropped; every window closes
+/// its dialog for it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptResolved {
+    pub prompt_id: String,
+}
+
+/// One window of this process (`windows:changed`, `window_list`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowInfo {
+    /// `main` or `w-<n>`.
+    pub label: String,
+    pub title: String,
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn_id: Option<String>,
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn_name: Option<String>,
+    pub focused: bool,
+    /// 1-based display number, smallest free.
+    pub index: u32,
+}
+
+/// `window_init`: who the calling window is and what it opens with.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowInit {
+    pub label: String,
+    pub index: u32,
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_conn_id: Option<String>,
+}
+
+/// Another BulkDB process sharing the config directory.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceInfo {
+    pub pid: u32,
+    pub instance_id: String,
+    /// `desktop` or `cli`.
+    pub kind: String,
+    pub started_at: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstancesInfo {
+    pub self_pid: u32,
+    /// Live instances other than this process.
+    pub others: Vec<InstanceInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -1165,6 +1378,12 @@ pub enum CoreEvent {
     TunnelHostKey(HostKeyPrompt),
     TunnelPassword(SshPasswordPrompt),
     DriversChanged(Vec<DriverInfo>),
+    /// Saved connections changed (this process or another one, see `config_poll`).
+    ConnectionsChanged,
+    /// Settings changed (this process or another one, see `config_poll`).
+    SettingsChanged(Settings),
+    /// A tunnel prompt is gone (answered, timed out, forgotten or its waiter dropped).
+    PromptResolved(PromptResolved),
 }
 
 /// Helper: now as RFC 3339 with milliseconds.
@@ -1227,6 +1446,44 @@ mod tests {
 
         let err = crate::error::ErrorPayload { code: "IO".into(), message: "m".into(), detail: None };
         assert_eq!(serde_json::to_value(&err).unwrap(), serde_json::json!({ "code": "IO", "message": "m" }));
+    }
+
+    /// The tag is lowercase on the wire, absent (not `null`) when unset, and a connection
+    /// without the key reads back as untagged.
+    #[test]
+    fn connection_tag_wire_format() {
+        let untagged = Connection { id: "c1".into(), name: "n".into(), driver: "sqlite".into(), ..Default::default() };
+        let v = serde_json::to_value(&untagged).unwrap();
+        assert!(v.as_object().unwrap().get("tag").is_none(), "{v}");
+        assert!(!serde_json::to_string(&untagged).unwrap().contains("null"));
+        let back: Connection = serde_json::from_value(v).unwrap();
+        assert_eq!(back.tag, None);
+
+        for (tag, wire) in [
+            (ConnTag::Local, "local"),
+            (ConnTag::Development, "development"),
+            (ConnTag::Testing, "testing"),
+            (ConnTag::Staging, "staging"),
+            (ConnTag::Production, "production"),
+        ] {
+            let c = Connection { tag: Some(tag), ..untagged.clone() };
+            let v = serde_json::to_value(&c).unwrap();
+            assert_eq!(v["tag"], wire);
+            assert_eq!(serde_json::from_value::<Connection>(v).unwrap().tag, Some(tag));
+            assert_eq!(tag.as_str(), wire);
+            assert_eq!(tag.to_string(), wire);
+            assert_eq!(wire.to_uppercase().parse::<ConnTag>(), Ok(tag));
+        }
+        assert!("prod".parse::<ConnTag>().is_err());
+        assert!(serde_json::from_str::<ConnTag>("\"Production\"").is_err(), "the wire value is lowercase only");
+
+        // `ConnectionInput` flattens the connection: the tag rides along at the top level.
+        let input: ConnectionInput =
+            serde_json::from_str(r#"{"id":"","name":"n","driver":"sqlite","tag":"staging","fields":{},"session":{},"savePassword":true}"#).unwrap();
+        assert_eq!(input.connection.tag, Some(ConnTag::Staging));
+        let input: ConnectionInput = serde_json::from_str(r#"{"id":"","name":"n","driver":"sqlite","fields":{},"session":{},"savePassword":true}"#).unwrap();
+        assert_eq!(input.connection.tag, None);
+        assert!(serde_json::to_value(&input).unwrap().as_object().unwrap().get("tag").is_none());
     }
 
     #[test]

@@ -40,6 +40,7 @@ async fn harness(wide: u64, nasty: u64) -> Harness {
         credentials: Some(Box::new(MemoryStore::default())),
         init_logging: false,
         prompts: None,
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -394,9 +395,15 @@ async fn startup_moves_connection_string_passwords_out_of_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().join("config");
     let open = || async {
-        BulkDb::new(BulkDbOptions { config_dir: Some(config_dir.clone()), credentials: Some(Box::new(MemoryStore::default())), init_logging: false, prompts: None })
-            .await
-            .unwrap()
+        BulkDb::new(BulkDbOptions {
+            config_dir: Some(config_dir.clone()),
+            credentials: Some(Box::new(MemoryStore::default())),
+            init_logging: false,
+            prompts: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
     };
     // A hand-edited / older file, written straight to disk (the config store itself refuses to
     // write such a string).
@@ -815,9 +822,15 @@ async fn exact_count_survives_restart() {
 
 /// A second facade over the same config dir as [`harness`] (a restart of the app).
 async fn reopen(dir: &Path) -> Arc<BulkDb> {
-    BulkDb::new(BulkDbOptions { config_dir: Some(dir.join("config")), credentials: Some(Box::new(MemoryStore::default())), init_logging: false, prompts: None })
-        .await
-        .unwrap()
+    BulkDb::new(BulkDbOptions {
+        config_dir: Some(dir.join("config")),
+        credentials: Some(Box::new(MemoryStore::default())),
+        init_logging: false,
+        prompts: None,
+        ..Default::default()
+    })
+    .await
+    .unwrap()
 }
 
 /// Record `n` finished dummy runs for `conn_id` directly in the history database.
@@ -918,5 +931,52 @@ async fn diagnostics_bundle_and_dbeaver_import() {
     assert!(db.conn_test(&saved.id, None).await.is_ok());
     assert_eq!(db.conn_list().len(), 2);
     assert!(matches!(db.conn_import_dbeaver("/no/such/file.json"), Err(CoreError::Io(_))));
+    db.shutdown().await;
+}
+
+/// `conn_save` / `conn_list` / `conn_get` carry the environment tag; saving without one clears
+/// it, connections.toml keeps it across a restart, and a DBeaver connection type survives
+/// import + save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_tag_is_saved_listed_and_cleared() {
+    let h = harness(10, 0).await;
+    let db = &h.db;
+    assert_eq!(db.conn_get(&h.conn_id).unwrap().tag, None, "untagged by default");
+
+    let mut input = sqlite_input("fixture", &h.dir.path().join("fixture.db"), true, None);
+    input.connection.id = h.conn_id.clone();
+    input.connection.tag = Some(ConnTag::Production);
+    let saved = db.conn_save(input.clone()).unwrap();
+    assert_eq!((saved.id.as_str(), saved.tag), (h.conn_id.as_str(), Some(ConnTag::Production)));
+    assert_eq!(db.conn_list()[0].tag, Some(ConnTag::Production));
+    assert_eq!(db.conn_get(&h.conn_id).unwrap().tag, Some(ConnTag::Production));
+    let ipc = serde_json::to_value(db.conn_list()).unwrap();
+    assert_eq!(ipc[0]["tag"], "production");
+
+    let toml_path = h.dir.path().join("config").join("connections.toml");
+    assert!(std::fs::read_to_string(&toml_path).unwrap().contains("tag = \"production\""));
+    let reread = bulk_core::config::ConfigStore::open(h.dir.path().join("config")).unwrap();
+    assert_eq!(reread.get(&h.conn_id).unwrap().tag, Some(ConnTag::Production), "the tag survives a restart");
+
+    // The UI clears the tag by omitting it.
+    input.connection.tag = None;
+    let cleared = db.conn_save(input).unwrap();
+    assert_eq!(cleared.tag, None);
+    assert_eq!(db.conn_get(&h.conn_id).unwrap().tag, None);
+    assert!(serde_json::to_value(db.conn_get(&h.conn_id).unwrap()).unwrap().get("tag").is_none());
+    assert!(!std::fs::read_to_string(&toml_path).unwrap().contains("tag ="));
+
+    let json_path = h.dir.path().join("data-sources.json");
+    let json = format!(
+        r#"{{ "connections": {{ "sqlite-9": {{ "provider": "sqlite", "name": "staged", "configuration": {{ "database": {path:?}, "type": "test" }} }} }} }}"#,
+        path = h.dir.path().join("fixture.db").display().to_string()
+    );
+    std::fs::write(&json_path, json).unwrap();
+    let rows = db.conn_import_dbeaver(&json_path.display().to_string()).unwrap();
+    assert_eq!(rows[0].connection.tag, Some(ConnTag::Testing));
+    let mut imported = rows[0].connection.clone();
+    imported.id.clear();
+    let saved = db.conn_save(ConnectionInput { connection: imported, ..Default::default() }).unwrap();
+    assert_eq!(db.conn_get(&saved.id).unwrap().tag, Some(ConnTag::Testing));
     db.shutdown().await;
 }

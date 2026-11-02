@@ -14,6 +14,7 @@
 //!       "configuration": {
 //!         "host": "db.example.com", "port": "5432", "database": "analytics", "user": "reader",
 //!         "url": "jdbc:postgresql://db.example.com:5432/analytics",
+//!         "type": "prod",
 //!         "handlers": { "ssh_tunnel": { "type": "tunnel", "enabled": true,
 //!                       "properties": { "host": "bastion", "port": "22", "userName": "ec2-user",
 //!                                       "authType": "PUBLIC_KEY", "keyPath": "~/.ssh/id_ed25519" } } }
@@ -22,6 +23,11 @@
 //!   }
 //! }
 //! ```
+//!
+//! `configuration.type` is DBeaver's connection type: the built-in `dev` / `test` / `prod`, or
+//! the id of a custom type declared in the root `connection-types` object (`{"id": {"name":
+//! "Staging", ...}}`). It becomes the connection's environment tag when it maps onto one;
+//! otherwise the connection stays untagged.
 //!
 //! Passwords are never imported: DBeaver stores them encrypted in a separate file and BulkDB
 //! keeps secrets only in the OS credential store, so the user types them once after import.
@@ -33,7 +39,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::{CoreError, Result};
-use crate::types::{Connection, ImportedConnection, SessionOpts, SshAuth, SshConfig};
+use crate::types::{ConnTag, Connection, ImportedConnection, SessionOpts, SshAuth, SshConfig};
 
 /// Read and parse a `data-sources.json` file.
 pub fn import_file(path: &Path) -> Result<Vec<ImportedConnection>> {
@@ -46,7 +52,8 @@ pub fn parse(json: &str) -> Result<Vec<ImportedConnection>> {
     let root: Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).map_err(|e| CoreError::Invalid(format!("not a DBeaver data-sources.json: {e}")))?;
     let conns = root.get("connections").and_then(Value::as_object).ok_or_else(|| CoreError::Invalid("no \"connections\" object found in data-sources.json".into()))?;
     let folders = root.get("folders").and_then(Value::as_object);
-    let mut out: Vec<ImportedConnection> = conns.iter().map(|(id, v)| convert(id, v, folders)).collect();
+    let types = root.get("connection-types").and_then(Value::as_object);
+    let mut out: Vec<ImportedConnection> = conns.iter().map(|(id, v)| convert(id, v, folders, types)).collect();
     out.sort_by_key(|r| r.connection.name.to_lowercase());
     Ok(out)
 }
@@ -62,6 +69,23 @@ pub fn map_provider(provider: &str) -> Option<&'static str> {
         "odbc" | "generic" => Some("odbc"),
         _ => None,
     }
+}
+
+/// Map a DBeaver connection type onto a BulkDB environment tag. The id is tried first (DBeaver's
+/// built-in `dev`, `test`, `prod`, plus the obvious spellings of the other tags), then the
+/// display name of a custom type from the root `connection-types` object. `None` = untagged.
+pub fn map_connection_type(type_id: &str, types: Option<&serde_json::Map<String, Value>>) -> Option<ConnTag> {
+    fn by_word(word: &str) -> Option<ConnTag> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "local" | "localhost" => Some(ConnTag::Local),
+            "dev" | "develop" | "development" => Some(ConnTag::Development),
+            "test" | "testing" | "qa" => Some(ConnTag::Testing),
+            "stage" | "staging" | "stg" => Some(ConnTag::Staging),
+            "prod" | "production" | "live" => Some(ConnTag::Production),
+            _ => None,
+        }
+    }
+    by_word(type_id).or_else(|| types?.get(type_id.trim())?.get("name")?.as_str().and_then(by_word))
 }
 
 /// Host / port / database pieces of a JDBC URL.
@@ -219,7 +243,7 @@ pub fn stable_id(dbeaver_id: &str) -> String {
     format!("{h:016x}")[..12].to_string()
 }
 
-fn convert(id: &str, v: &Value, folders: Option<&serde_json::Map<String, Value>>) -> ImportedConnection {
+fn convert(id: &str, v: &Value, folders: Option<&serde_json::Map<String, Value>>, types: Option<&serde_json::Map<String, Value>>) -> ImportedConnection {
     let mut notes = Vec::new();
     let obj = v.as_object();
     let name = str_field(obj, "name").unwrap_or_else(|| id.to_string());
@@ -228,9 +252,22 @@ fn convert(id: &str, v: &Value, folders: Option<&serde_json::Map<String, Value>>
     let cfg = obj.and_then(|o| o.get("configuration")).and_then(Value::as_object);
     let url = str_field(cfg, "url").map(|u| parse_jdbc_url(&u)).unwrap_or_default();
 
+    let tag = match str_field(cfg, "type") {
+        Some(type_id) => {
+            let tag = map_connection_type(&type_id, types);
+            if tag.is_none() {
+                let label = types.and_then(|t| t.get(&type_id)).and_then(|t| t.get("name")).and_then(Value::as_str).unwrap_or(type_id.as_str());
+                notes.push(format!("DBeaver connection type '{label}' has no matching environment tag; the connection is untagged"));
+            }
+            tag
+        }
+        None => None,
+    };
+
     let mut conn = Connection {
         id: stable_id(id),
         name,
+        tag,
         driver: String::new(),
         host: str_field(cfg, "host").or(url.host.clone()),
         port: port_field(cfg, "port").or(url.port),
@@ -243,6 +280,10 @@ fn convert(id: &str, v: &Value, folders: Option<&serde_json::Map<String, Value>>
         save_password: true,
         has_password: false,
         has_ssh_secret: false,
+        // DBeaver imports never mark a connection write-allowed (docs/db-copy.md 2).
+        write_allowed: None,
+        // Computed on read; an imported row never carries a session password.
+        has_session_password: None,
     };
 
     match map_provider(&provider) {
@@ -438,6 +479,69 @@ mod tests {
         let mongo = by_name("docs");
         assert_eq!(mongo.connection.driver, "mongodb");
         assert!(mongo.notes.iter().any(|n| n.contains("unsupported provider")));
+
+        // No `configuration.type` anywhere: every row stays untagged, without a note.
+        assert!(rows.iter().all(|r| r.connection.tag.is_none()));
+        assert!(rows.iter().all(|r| !r.notes.iter().any(|n| n.contains("connection type"))));
+    }
+
+    #[test]
+    fn connection_types_become_tags() {
+        let json = r#"{
+          "connection-types": {
+            "dev": { "name": "Development", "color": "255,255,255" },
+            "my-stage": { "name": "Staging", "color": "255,200,0" },
+            "analytics-x": { "name": "Analytics sandbox" }
+          },
+          "connections": {
+            "a": { "provider": "postgresql", "name": "built-in prod", "configuration": { "host": "h", "type": "prod" } },
+            "b": { "provider": "postgresql", "name": "built-in test", "configuration": { "host": "h", "type": "test" } },
+            "c": { "provider": "postgresql", "name": "built-in dev", "configuration": { "host": "h", "type": "dev" } },
+            "d": { "provider": "postgresql", "name": "custom staging", "configuration": { "host": "h", "type": "my-stage" } },
+            "e": { "provider": "postgresql", "name": "custom unknown", "configuration": { "host": "h", "type": "analytics-x" } },
+            "f": { "provider": "postgresql", "name": "undeclared", "configuration": { "host": "h", "type": "weird" } },
+            "g": { "provider": "sqlite", "name": "no type", "configuration": { "database": "x.db" } },
+            "h": { "provider": "mysql", "name": "upper", "configuration": { "host": "h", "type": "PROD" } }
+          }
+        }"#;
+        let rows = parse(json).unwrap();
+        let row = |n: &str| rows.iter().find(|r| r.connection.name == n).unwrap();
+        assert_eq!(row("built-in prod").connection.tag, Some(ConnTag::Production));
+        assert_eq!(row("built-in test").connection.tag, Some(ConnTag::Testing));
+        assert_eq!(row("built-in dev").connection.tag, Some(ConnTag::Development));
+        assert_eq!(row("custom staging").connection.tag, Some(ConnTag::Staging));
+        assert_eq!(row("upper").connection.tag, Some(ConnTag::Production));
+        assert_eq!(row("no type").connection.tag, None);
+        assert!(row("no type").notes.iter().all(|n| !n.contains("connection type")));
+        // Unmappable types stay untagged and say so (with the type's display name when known).
+        let unknown = row("custom unknown");
+        assert_eq!(unknown.connection.tag, None);
+        assert!(unknown.notes.iter().any(|n| n.contains("'Analytics sandbox'") && n.contains("untagged")), "{:?}", unknown.notes);
+        let undeclared = row("undeclared");
+        assert_eq!(undeclared.connection.tag, None);
+        assert!(undeclared.notes.iter().any(|n| n.contains("'weird'")), "{:?}", undeclared.notes);
+        // The tag survives the JSON the UI receives.
+        let v = serde_json::to_value(row("built-in prod")).unwrap();
+        assert_eq!(v["connection"]["tag"], "production");
+        assert!(serde_json::to_value(row("no type")).unwrap()["connection"].get("tag").is_none());
+    }
+
+    #[test]
+    fn connection_type_mapping() {
+        for (id, tag) in [
+            ("prod", Some(ConnTag::Production)),
+            ("production", Some(ConnTag::Production)),
+            ("test", Some(ConnTag::Testing)),
+            ("qa", Some(ConnTag::Testing)),
+            ("dev", Some(ConnTag::Development)),
+            ("staging", Some(ConnTag::Staging)),
+            ("local", Some(ConnTag::Local)),
+            (" Prod ", Some(ConnTag::Production)),
+            ("custom", None),
+            ("", None),
+        ] {
+            assert_eq!(map_connection_type(id, None), tag, "{id:?}");
+        }
     }
 
     #[test]

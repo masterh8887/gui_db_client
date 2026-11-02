@@ -13,7 +13,9 @@
 //!
 //! Issue codes produced here: `SQL_EMPTY` / `MULTI_STATEMENT` / `SQL_NOT_SELECT` /
 //! `SQL_EXEC_COMMENT` (blockers, from `sqlguard::check_for` with the source's dialect),
-//! `CONNECT_FAILED` (blocker), `WORK_MEM_HIGH` (danger), `WORK_MEM_INVALID`,
+//! `SQL_ENCODING` (blocker: the SQL holds a character the connection's SQL charset cannot
+//! represent, see [`check_sql_encoding`]), `CONNECT_FAILED` (blocker), `WORK_MEM_HIGH`
+//! (danger), `WORK_MEM_INVALID`,
 //! `EXPLAIN_FAILED` (info), `PLAN_LATERAL` (danger), `PLAN_SORT_SPILL` (warning),
 //! `PLAN_SEQ_SCAN_LARGE` (info), `CONCURRENT_SESSION` (warning), `SESSIONS_UNKNOWN` (info),
 //! `DISK_LOW` (warning), `DISK_FULL` (blocker), `DIR_NOT_WRITABLE` (blocker), `OVERWRITE`
@@ -64,8 +66,12 @@ pub async fn run(ctx: PreflightContext<'_>) -> PreflightReport {
     let dialect = sqlguard::Dialect::from_driver(ctx.source.driver_id());
     let check = sqlguard::check_for(ctx.sql, dialect);
     report.blockers.extend(check.issues.iter().cloned());
-    let sql_ok = check.ok;
     let sql = check.normalized.clone();
+    // A character the connection cannot encode would only fail the job after the warnings
+    // were acknowledged; it is a blocker, and EXPLAIN / session checks are skipped.
+    let encoding_issue = ctx.source.sql_charset().and_then(|cs| check_sql_encoding(cs, ctx.sql, &sql));
+    let sql_ok = check.ok && encoding_issue.is_none();
+    report.blockers.extend(encoding_issue);
 
     // --- probe -------------------------------------------------------------------------------
     let server: Option<ServerInfo> = match ctx.source.probe().await {
@@ -150,23 +156,15 @@ pub async fn run(ctx: PreflightContext<'_>) -> PreflightReport {
             if tables.is_empty() {
                 tables = sqlguard::referenced_tables_for(&sql, dialect);
             }
-            if !tables.is_empty() {
-                match monitor.active_sessions(&tables).await {
-                    Ok(sessions) if !sessions.is_empty() => {
-                        report.warnings.push(concurrent_session_issue(&sessions, &tables));
-                        report.sessions = sessions;
-                    }
-                    Ok(_) => {}
-                    Err(e) => report.warnings.push(PreflightIssue {
-                        code: "SESSIONS_UNKNOWN".into(),
-                        severity: Severity::Info,
-                        message: format!("Could not list concurrent sessions: {e}"),
-                        detail: Some(e.code().to_string()),
-                        recommendation: None,
-                    }),
-                }
-            }
+            let (issue, sessions) = concurrent_sessions(monitor, &tables).await;
+            report.warnings.extend(issue);
+            report.sessions = sessions;
         }
+    }
+
+    // --- output encoding ---------------------------------------------------------------------
+    if let Some(issue) = check_output_encoding(opts) {
+        report.blockers.push(issue);
     }
 
     // --- output directory --------------------------------------------------------------------
@@ -273,7 +271,32 @@ fn check_dir_writable(dir: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn concurrent_session_issue(sessions: &[SessionInfo], tables: &[TableRef]) -> PreflightIssue {
+/// The session check of [`run`] for a known table list, shared with the copy preflight
+/// (docs/db-copy.md 5.3): the other sessions of the source server touching `tables` (the
+/// monitor leaves out the asking session). `CONCURRENT_SESSION` (warning) when there are any,
+/// `SESSIONS_UNKNOWN` (info) when they cannot be listed, no issue otherwise; the sessions found
+/// come back too. An empty table list asks nothing.
+pub(crate) async fn concurrent_sessions(monitor: &dyn Monitor, tables: &[TableRef]) -> (Option<PreflightIssue>, Vec<SessionInfo>) {
+    if tables.is_empty() {
+        return (None, Vec::new());
+    }
+    match monitor.active_sessions(tables).await {
+        Ok(sessions) if !sessions.is_empty() => (Some(concurrent_session_issue(&sessions, tables)), sessions),
+        Ok(_) => (None, Vec::new()),
+        Err(e) => (
+            Some(PreflightIssue {
+                code: "SESSIONS_UNKNOWN".into(),
+                severity: Severity::Info,
+                message: format!("Could not list concurrent sessions: {e}"),
+                detail: Some(e.code().to_string()),
+                recommendation: None,
+            }),
+            Vec::new(),
+        ),
+    }
+}
+
+pub(crate) fn concurrent_session_issue(sessions: &[SessionInfo], tables: &[TableRef]) -> PreflightIssue {
     let names: Vec<String> = tables.iter().map(TableRef::qualified).collect();
     let lines: Vec<String> = sessions
         .iter()
@@ -444,6 +467,62 @@ fn subtree_first(node: &PlanNode, pred: fn(&PlanNode) -> bool) -> Option<&PlanNo
         return Some(node);
     }
     node.children.iter().find_map(|c| subtree_first(c, pred))
+}
+
+/// Blocker code of [`check_output_encoding`].
+pub const CSV_ENCODING_CODE: &str = "CSV_ENCODING";
+
+/// Code of the blocker raised by [`check_sql_encoding`].
+pub const SQL_ENCODING_CODE: &str = "SQL_ENCODING";
+
+/// The statement the driver will send (`statement`, the guard's normalized text, a substring of
+/// `user_sql`) holds a character the connection's SQL charset `cs` cannot represent ->
+/// `SQL_ENCODING` blocker naming the character and its line / column in `user_sql`, the text
+/// the user typed. Characters outside the statement (a comment after the final `;`) are never
+/// sent and do not count.
+pub fn check_sql_encoding(cs: crate::encoding::Charset, user_sql: &str, statement: &str) -> Option<PreflightIssue> {
+    let (text, base) = match user_sql.find(statement).filter(|_| !statement.is_empty()) {
+        Some(base) => (statement, base),
+        None => (user_sql, 0),
+    };
+    let u = crate::encoding::find_unrepresentable(cs, text)?.within(user_sql, base);
+    Some(PreflightIssue {
+        code: SQL_ENCODING_CODE.into(),
+        severity: Severity::Danger,
+        message: format!("The SQL contains {}, which the connection character set {} cannot represent.", u.describe(), cs.label()),
+        detail: Some(format!("line {}, column {}", u.line, u.column)),
+        recommendation: Some("Remove or replace the character, or choose a connection encoding that can represent it.".into()),
+    })
+}
+
+/// CSV output encoding check (owner: encoding; design doc section 6). A blocker
+/// (`CSV_ENCODING`, `Severity::Danger` in `blockers`) when `csv.null_as` contains a character
+/// the chosen encoding cannot represent: NULL would be written as `?` and could not be told
+/// apart from data. Header names and data are never blockers (replaced and counted instead).
+/// `None` for UTF-8, for Parquet and when every configured text is representable. Never a
+/// warning: warnings need an acknowledgement and EUC-KR output is a normal choice.
+///
+/// Called from [`run`]. The export path always runs preflight before the stream starts, so the
+/// job is rejected before any server work; other invalid combinations (a letter delimiter with
+/// EUC-KR) are `INVALID` errors from `export::build_target` / `CsvSink::validate`.
+pub fn check_output_encoding(opts: &crate::types::OutputOpts) -> Option<PreflightIssue> {
+    if opts.format != crate::types::OutputFormat::Csv {
+        return None;
+    }
+    let csv = opts.csv.as_ref()?;
+    let encoding = csv.effective_encoding();
+    let c = crate::encoding::first_unmappable(encoding.into(), &csv.null_as)?;
+    Some(PreflightIssue {
+        code: CSV_ENCODING_CODE.into(),
+        severity: Severity::Danger,
+        message: format!(
+            "The NULL text contains {c:?} (U+{:04X}), which {} cannot represent: NULL would be written as '?' and could not be told apart from data.",
+            c as u32,
+            crate::encoding::Charset::from(encoding).label()
+        ),
+        detail: Some(format!("csv.nullAs with csv.encoding = {}", encoding.as_str())),
+        recommendation: Some("Change the NULL text (e.g. empty, NULL or \\N) or write the file as UTF-8.".into()),
+    })
 }
 
 /// `work_mem x 3 > RAM x 10 %` check. Returns the warning and the recommended value.
@@ -711,6 +790,10 @@ mod tests {
         fn session_id(&self) -> Option<String> {
             None
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn driver_id(&self) -> &'static str {
             self.driver
         }
@@ -857,5 +940,109 @@ mod tests {
         let report = run(PreflightContext { request: &req, sql: "select 1", source: &src, monitor: None, target: &target, session: &session }).await;
         assert!(codes(&report.blockers).contains(&"DISK_FULL"), "{:?}", report.blockers);
         assert!(report.estimates.files.unwrap() > 1);
+    }
+
+    fn csv_output(null_as: &str, encoding: Option<crate::types::CsvEncoding>) -> OutputOpts {
+        let csv = crate::types::CsvOpts { null_as: null_as.into(), encoding, ..Default::default() };
+        OutputOpts { csv: Some(csv), ..OutputOpts::default() }
+    }
+
+    #[test]
+    fn output_encoding_blocks_only_an_unrepresentable_null_text() {
+        use crate::types::{CsvEncoding, OutputFormat};
+        assert!(check_output_encoding(&csv_output("NULL", Some(CsvEncoding::EucKr))).is_none());
+        assert!(check_output_encoding(&csv_output("", Some(CsvEncoding::EucKr))).is_none());
+        assert!(check_output_encoding(&csv_output("널", Some(CsvEncoding::EucKr))).is_none(), "Hangul is CP949");
+        assert!(check_output_encoding(&csv_output("∅🚫", None)).is_none(), "UTF-8 represents everything");
+        assert!(check_output_encoding(&csv_output("🚫", Some(CsvEncoding::Utf8))).is_none());
+        let issue = check_output_encoding(&csv_output("N🚫", Some(CsvEncoding::EucKr))).expect("blocker");
+        assert_eq!(issue.code, CSV_ENCODING_CODE);
+        assert_eq!(issue.severity, Severity::Danger);
+        assert!(issue.message.contains("U+1F6AB") && issue.message.contains("EUC-KR (CP949)"), "{}", issue.message);
+        assert_eq!(issue.detail.as_deref(), Some("csv.nullAs with csv.encoding = euc-kr"));
+        // Parquet ignores csv options entirely.
+        let mut parquet = csv_output("🚫", Some(CsvEncoding::EucKr));
+        parquet.format = OutputFormat::Parquet;
+        assert!(check_output_encoding(&parquet).is_none());
+        assert!(check_output_encoding(&OutputOpts::default()).is_none(), "no csv options");
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_unrepresentable_null_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut req, mut target) = request(dir.path(), None, false);
+        target.opts.csv = csv_output("🚫", Some(crate::types::CsvEncoding::EucKr)).csv;
+        req.output = target.opts.clone();
+        let src = FakeSource { driver: "fake", probe: Ok(server(4 * GB, "64MB", None)), explain: Ok(Some(plan(10.0, 100))) };
+        let session = SessionOpts::default();
+        let report = run(PreflightContext { request: &req, sql: "select 1", source: &src, monitor: None, target: &target, session: &session }).await;
+        assert!(codes(&report.blockers).contains(&CSV_ENCODING_CODE), "{:?}", report.blockers);
+        assert!(!codes(&report.warnings).contains(&CSV_ENCODING_CODE), "never a warning");
+    }
+
+    /// A source whose connection encodes SQL as EUC-KR (MySQL pass-through / pre-4.1).
+    struct EucKrSource(FakeSource);
+
+    #[async_trait]
+    impl Source for EucKrSource {
+        async fn probe(&self) -> Result<ServerInfo> {
+            self.0.probe().await
+        }
+        async fn apply_session(&self, opts: &SessionOpts) -> Result<()> {
+            self.0.apply_session(opts).await
+        }
+        async fn stream(&self, q: &Query, opts: &SessionOpts, cancel: CancellationToken) -> Result<SourceStream> {
+            self.0.stream(q, opts, cancel).await
+        }
+        async fn explain(&self, sql: &str, analyze: bool) -> Result<Option<PlanSummary>> {
+            self.0.explain(sql, analyze).await
+        }
+        fn session_id(&self) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn driver_id(&self) -> &'static str {
+            "mysql"
+        }
+        fn sql_charset(&self) -> Option<crate::encoding::Charset> {
+            Some(crate::encoding::Charset::EucKr)
+        }
+    }
+
+    #[test]
+    fn sql_encoding_positions_are_in_the_users_text() {
+        use crate::encoding::Charset;
+        let user = "\n  select '한글',\n         '😀' from t;  -- 🚀 after the statement\n";
+        let statement = sqlguard::check_for(user, sqlguard::Dialect::from_driver("mysql")).normalized;
+        let issue = check_sql_encoding(Charset::EucKr, user, &statement).expect("blocker");
+        assert_eq!(issue.code, SQL_ENCODING_CODE);
+        assert_eq!(issue.severity, Severity::Danger);
+        assert!(issue.message.contains("'😀' (U+1F600) at line 3, column 11") && issue.message.contains("EUC-KR (CP949)"), "{}", issue.message);
+        assert_eq!(issue.detail.as_deref(), Some("line 3, column 11"));
+        // The trailing comment is never sent, so its rocket does not block.
+        let user = "select '한글' from t;  -- 🚀";
+        let statement = sqlguard::check_for(user, sqlguard::Dialect::from_driver("mysql")).normalized;
+        assert!(check_sql_encoding(Charset::EucKr, user, &statement).is_none());
+        assert!(check_sql_encoding(Charset::Utf8, "select '😀'", "select '😀'").is_none());
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_sql_is_a_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, target) = request(dir.path(), None, false);
+        let src = EucKrSource(FakeSource { driver: "mysql", probe: Ok(server(4 * GB, "64MB", None)), explain: Err(CoreError::Invalid("explain must not run".into())) });
+        let session = SessionOpts::default();
+        let report =
+            run(PreflightContext { request: &req, sql: "select name\nfrom t where name = '😀'", source: &src, monitor: None, target: &target, session: &session }).await;
+        let issue = report.blockers.iter().find(|i| i.code == SQL_ENCODING_CODE).unwrap_or_else(|| panic!("{:?}", report.blockers));
+        assert!(issue.message.contains("line 2, column 22"), "{}", issue.message);
+        assert!(!codes(&report.warnings).contains(&SQL_ENCODING_CODE), "never an acknowledgeable warning");
+        assert!(!codes(&report.warnings).contains(&"EXPLAIN_FAILED"), "EXPLAIN is skipped: {:?}", report.warnings);
+        // Representable Korean text passes.
+        let report = run(PreflightContext { request: &req, sql: "select '한글' from t", source: &src, monitor: None, target: &target, session: &session }).await;
+        assert!(!codes(&report.blockers).contains(&SQL_ENCODING_CODE), "{:?}", report.blockers);
     }
 }

@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
+/** Quiet empty / placeholder message: 13px secondary title, 12px hint (DESIGN.md §7.4). */
 export function EmptyState({
   icon,
   title,
@@ -20,15 +21,15 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        'flex flex-col items-center justify-center gap-2 text-center text-muted-foreground',
-        compact ? 'px-2 py-6' : 'h-full p-6',
+        'flex flex-col items-center justify-center gap-1.5 text-center text-fg-secondary',
+        compact ? 'px-3 py-6' : 'h-full p-6',
         className,
       )}
     >
-      {icon && <div className="text-muted-foreground/60">{icon}</div>}
-      <div className="text-[13px]">{title}</div>
-      {hint && <div className="text-xs">{hint}</div>}
-      {action && <div className="mt-1">{action}</div>}
+      {icon && <div className="mb-1 text-fg-tertiary">{icon}</div>}
+      <div className="text-base">{title}</div>
+      {hint && <div className="text-sm text-fg-secondary">{hint}</div>}
+      {action && <div className="mt-2 flex items-center gap-2">{action}</div>}
     </div>
   );
 }

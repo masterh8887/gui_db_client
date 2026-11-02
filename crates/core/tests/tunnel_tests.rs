@@ -336,6 +336,8 @@ struct RecordingPrompts {
     secret: Option<String>,
     host_keys: Mutex<Vec<HostKeyPrompt>>,
     secret_kinds: Mutex<Vec<String>>,
+    /// (conn_name, job_label) of every secret prompt.
+    secret_contexts: Mutex<Vec<(Option<String>, Option<String>)>>,
 }
 
 #[async_trait]
@@ -348,6 +350,7 @@ impl PromptHandler for RecordingPrompts {
         assert_eq!(prompt.user, "alice");
         assert_eq!(prompt.host, "bastion.example");
         self.secret_kinds.lock().unwrap().push(prompt.kind);
+        self.secret_contexts.lock().unwrap().push((prompt.conn_name, prompt.job_label));
         Ok(self.secret.clone())
     }
 }
@@ -449,6 +452,33 @@ async fn fake_ssh_host_key_accepted_then_secret_cancelled() {
     assert_eq!(prompts.host_keys.lock().unwrap().len(), 1);
     assert_eq!(*prompts.secret_kinds.lock().unwrap(), vec!["password".to_string()], "\"yes\" reached the script, which then asked for the password");
     assert!(mgr.status().is_empty());
+    mgr.shutdown().await;
+}
+
+/// Multi-window context: the prompts of a tunnel opened for a connection and a job carry both
+/// names (shown as "{connection} · {job}"); a plain `acquire` carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fake_ssh_prompts_say_which_connection_and_job_they_are_for() {
+    let fake = FakeSsh::new("hostkey-context", HOSTKEY_PS1, HOSTKEY_SH);
+    let prompts = Arc::new(RecordingPrompts { accept_host_key: true, secret: None, ..Default::default() });
+    let mgr = fake.manager(prompts.clone(), Duration::from_secs(60));
+    let context = bulk_core::tunnel::PromptContext { conn_name: Some("운영 DB".into()), job_label: Some("legacy.shop → new.shop".into()) };
+    let res = tokio::time::timeout(ACQUIRE_TIMEOUT, mgr.acquire_with(&cfg(SshAuth::Password), "db.internal", 5432, None, context)).await.expect("acquire must return");
+    assert!(matches!(res, Err(CoreError::Cancelled)), "{:?}", res.err());
+    {
+        let keys = prompts.host_keys.lock().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!((keys[0].conn_name.as_deref(), keys[0].job_label.as_deref()), (Some("운영 DB"), Some("legacy.shop → new.shop")));
+    }
+    assert_eq!(*prompts.secret_contexts.lock().unwrap(), vec![(Some("운영 DB".to_string()), Some("legacy.shop → new.shop".to_string()))]);
+    mgr.shutdown().await;
+
+    // Without a context (plain acquire) the fields stay empty.
+    let prompts = Arc::new(RecordingPrompts { accept_host_key: true, secret: None, ..Default::default() });
+    let mgr = fake.manager(prompts.clone(), Duration::from_secs(60));
+    let _ = acquire_err(&mgr, &cfg(SshAuth::Password), None).await;
+    let keys = prompts.host_keys.lock().unwrap().clone();
+    assert!(keys.iter().all(|k| k.conn_name.is_none() && k.job_label.is_none()));
     mgr.shutdown().await;
 }
 

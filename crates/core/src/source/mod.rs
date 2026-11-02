@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -25,6 +27,15 @@ pub mod arrow_batch;
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+/// Shared MySQL-family logic over `MysqlRawQuery` (owner: modern).
+#[cfg(feature = "mysql")]
+pub mod mysql_common;
+/// MySQL connection fields, text plan and protocol dispatch (owner: shared).
+#[cfg(feature = "mysql")]
+pub mod mysql_dispatch;
+/// Pre-4.1 MySQL client (owner: legacy).
+#[cfg(feature = "mysql")]
+pub mod mysql_legacy;
 #[cfg(has_odbc)]
 pub mod odbc;
 #[cfg(has_oracle)]
@@ -97,6 +108,21 @@ pub enum StreamOutput {
 pub struct Query {
     pub sql: String,
     pub output: StreamOutput,
+    /// Byte limit of one batch; `None` = [`crate::BATCH_BYTES`]. Every reader honours it (DB
+    /// copy runs several readers at once and divides the budget, docs/db-copy.md 4.1).
+    pub max_batch_bytes: Option<usize>,
+}
+
+impl Query {
+    /// A query with the default batch size.
+    pub fn new(sql: impl Into<String>, output: StreamOutput) -> Query {
+        Query { sql: sql.into(), output, max_batch_bytes: None }
+    }
+
+    /// The byte limit of one batch (`max_batch_bytes`, else [`crate::BATCH_BYTES`]), at least 1.
+    pub fn batch_bytes(&self) -> usize {
+        self.max_batch_bytes.unwrap_or(crate::BATCH_BYTES).max(1)
+    }
 }
 
 /// Result of [`Source::stream`].
@@ -105,6 +131,10 @@ pub struct SourceStream {
     /// `None` when the first batch carries it.
     pub schema: Option<SchemaRef>,
     pub stream: BoxStream<'static, Result<Batch>>,
+    /// U+FFFD characters produced by decoding a non-UTF-8 source so far: filled by the MySQL
+    /// readers with a non-UTF-8 `TextPlan` (and the PG SQL_ASCII transcoder of DB copy).
+    /// `None` when the reader decodes nothing.
+    pub replaced: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -202,9 +232,21 @@ pub trait Source: Send + Sync {
     /// Driver id (`postgres`, ...).
     fn driver_id(&self) -> &'static str;
 
+    /// The concrete driver object, for driver-specific seams (`mysql_raw`, DB copy's
+    /// `PgDatabase` client). Every implementation returns `self`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Whether this driver can produce `Batch::RawCsv` (PostgreSQL only).
     fn supports_raw_csv(&self) -> bool {
         false
+    }
+
+    /// Charset this connection encodes the SQL text into before sending it, when that charset
+    /// cannot represent every character (MySQL pass-through and pre-4.1 connections:
+    /// EUC-KR / latin1). `None`: any SQL text can be sent. Preflight blocks SQL holding a
+    /// character this charset cannot represent (`SQL_ENCODING`).
+    fn sql_charset(&self) -> Option<crate::encoding::Charset> {
+        None
     }
 }
 
@@ -218,7 +260,8 @@ pub async fn open(params: &ConnectParams) -> Result<Box<dyn Database>> {
         #[cfg(feature = "postgres")]
         "postgres" => Ok(Box::new(postgres::PgDatabase::connect(params).await?)),
         #[cfg(feature = "mysql")]
-        "mysql" => Ok(Box::new(mysql::MySqlDatabase::connect(params).await?)),
+        // `protocol` = auto / modern / legacy picks mysql_async or the pre-4.1 client.
+        "mysql" => mysql_dispatch::open(params).await,
         #[cfg(feature = "mssql")]
         "mssql" => Ok(Box::new(mssql::MssqlDatabase::connect(params).await?)),
         "sqlite" => Ok(Box::new(sqlite::SqliteDatabase::connect(params).await?)),
@@ -228,6 +271,17 @@ pub async fn open(params: &ConnectParams) -> Result<Box<dyn Database>> {
         "oracle" => Ok(Box::new(oracle::OracleDatabase::connect(params).await?)),
         other => Err(CoreError::DriverMissing { id: other.to_string(), detail: "driver is not compiled into this build".into() }),
     }
+}
+
+/// The MySQL-family raw query surface of a connection (modern or legacy client); `None` for
+/// every other driver.
+#[cfg(feature = "mysql")]
+pub fn mysql_raw(db: &dyn Database) -> Option<&dyn mysql_common::MysqlRawQuery> {
+    let any = db.as_any();
+    if let Some(m) = any.downcast_ref::<mysql::MySqlDatabase>() {
+        return Some(m);
+    }
+    any.downcast_ref::<mysql_legacy::MySqlLegacyDatabase>().map(|m| m as &dyn mysql_common::MysqlRawQuery)
 }
 
 /// Whether a driver id is compiled into this build (independent of vendor libraries).

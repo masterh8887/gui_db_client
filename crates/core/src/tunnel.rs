@@ -82,6 +82,15 @@ pub trait PromptHandler: Send + Sync {
 }
 
 /// Non-interactive handler: rejects unknown host keys, provides no secrets.
+/// Who a tunnel prompt is for: the connection name and, when a job opens the connection, its
+/// label. Filled into `HostKeyPrompt` / `SshPasswordPrompt` (`conn_name`, `job_label`), which the
+/// dialogs show as "{connection} · {job}" (multi-window, docs/db-copy.md 1.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptContext {
+    pub conn_name: Option<String>,
+    pub job_label: Option<String>,
+}
+
 pub struct DenyAllPrompts;
 
 #[async_trait]
@@ -559,6 +568,8 @@ struct ReaderShared {
 /// Everything the reader thread needs to answer prompts.
 struct ReaderCtx {
     prompts: Arc<dyn PromptHandler>,
+    /// Which connection / job the prompts are for.
+    context: PromptContext,
     handle: tokio::runtime::Handle,
     user: String,
     host: String,
@@ -649,6 +660,8 @@ fn run_reader(mut reader: Box<dyn Read + Send>, mut writer: Box<dyn Write + Send
                     fingerprint: info.fingerprint.clone(),
                     key_type: info.key_type.clone(),
                     message: info.message.clone(),
+                    conn_name: ctx.context.conn_name.clone(),
+                    job_label: ctx.context.job_label.clone(),
                 };
                 ctx.set_pending(true);
                 let answer = ctx.handle.block_on(ctx.prompts.host_key(prompt));
@@ -681,8 +694,14 @@ fn run_reader(mut reader: Box<dyn Read + Send>, mut writer: Box<dyn Write + Send
                     }
                     None => {
                         tracing::info!(kind, user = %ctx.user, host = %ctx.host, "ssh secret requested");
-                        let prompt =
-                            SshPasswordPrompt { prompt_id: uuid::Uuid::new_v4().to_string(), host: ctx.host.clone(), user: ctx.user.clone(), kind: kind.to_string() };
+                        let prompt = SshPasswordPrompt {
+                            prompt_id: uuid::Uuid::new_v4().to_string(),
+                            host: ctx.host.clone(),
+                            user: ctx.user.clone(),
+                            kind: kind.to_string(),
+                            conn_name: ctx.context.conn_name.clone(),
+                            job_label: ctx.context.job_label.clone(),
+                        };
                         ctx.set_pending(true);
                         let r = ctx.handle.block_on(ctx.prompts.ssh_secret(prompt));
                         ctx.set_pending(false);
@@ -897,6 +916,13 @@ impl TunnelManager {
     /// stored ssh password / key passphrase, if any; when it is missing or wrong the prompt
     /// handler is asked once.
     pub async fn acquire(&self, cfg: &SshConfig, target_host: &str, target_port: u16, secret: Option<String>) -> Result<TunnelLease> {
+        self.acquire_with(cfg, target_host, target_port, secret, PromptContext::default()).await
+    }
+
+    /// [`TunnelManager::acquire`] whose host-key and password prompts carry `context` (the
+    /// connection name and the job label), so the window that shows them can say which
+    /// connection and job they are for (docs/db-copy.md 1.1). A reused tunnel prompts nothing.
+    pub async fn acquire_with(&self, cfg: &SshConfig, target_host: &str, target_port: u16, secret: Option<String>, context: PromptContext) -> Result<TunnelLease> {
         if !cfg.enabled {
             return Err(CoreError::Invalid("ssh tunnel is disabled for this connection".into()));
         }
@@ -916,19 +942,19 @@ impl TunnelManager {
         }
 
         let stored = if cfg.auth == SshAuth::Agent { None } else { secret.filter(|s| !s.is_empty()) };
-        let mut result = self.start(cfg, target_host, target_port, stored.clone()).await;
+        let mut result = self.start(cfg, target_host, target_port, stored.clone(), &context).await;
         if let Err(CoreError::Tunnel(msg)) = &result {
             // The picked local port was taken (by another program, or between the pick and
             // ssh's bind): one retry on the next pick, with the same stored secret.
             if msg.contains("Address already in use") || msg.contains("cannot listen to port") {
                 tracing::warn!(key = %key, "local forward port was taken; retrying on another port");
-                result = self.start(cfg, target_host, target_port, stored.clone()).await;
+                result = self.start(cfg, target_host, target_port, stored.clone(), &context).await;
             }
         }
         if let Err(CoreError::Auth(_)) = &result {
             if stored.is_some() {
                 tracing::warn!(key = %key, "stored ssh secret was rejected; asking the user");
-                result = self.start(cfg, target_host, target_port, None).await;
+                result = self.start(cfg, target_host, target_port, None, &context).await;
             }
         }
         let (process, local_port) = result?;
@@ -959,7 +985,7 @@ impl TunnelManager {
     }
 
     /// Spawn ssh and wait until the forwarded port accepts connections.
-    async fn start(&self, cfg: &SshConfig, target_host: &str, target_port: u16, stored_secret: Option<String>) -> Result<(TunnelProcess, u16)> {
+    async fn start(&self, cfg: &SshConfig, target_host: &str, target_port: u16, stored_secret: Option<String>, context: &PromptContext) -> Result<(TunnelProcess, u16)> {
         let local_port = (self.port_picker)()?;
         if !local_port_free(local_port) {
             // Same wording as ssh's own bind failure, so `acquire` retries on the next pick.
@@ -990,6 +1016,7 @@ impl TunnelManager {
         let shared = Arc::new(Mutex::new(ReaderShared::default()));
         let ctx = ReaderCtx {
             prompts: Arc::clone(&self.prompts),
+            context: context.clone(),
             handle: tokio::runtime::Handle::current(),
             user: cfg.user.clone(),
             host: cfg.host.clone(),

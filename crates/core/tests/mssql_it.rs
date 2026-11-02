@@ -95,7 +95,7 @@ async fn connect(application_name: &str) -> Option<MssqlDatabase> {
 }
 
 fn query(sql: &str) -> Query {
-    Query { sql: sql.to_string(), output: StreamOutput::Arrow }
+    Query { sql: sql.to_string(), output: StreamOutput::Arrow, max_batch_bytes: None }
 }
 
 fn tref(name: &str) -> TableRef {

@@ -3,7 +3,10 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { catalogExactCount, exportStart, jobGet } from '@/lib/commands';
-import { stateLabel, t } from '@/lib/i18n';
+import { registerBuiltinActions } from '@/lib/actions';
+import { setConfirmHandler } from '@/lib/confirm';
+import { initWindows, resetWindowsInit, wins } from '@/stores/windows';
+import { stateLabel } from '@/lib/i18n';
 import { mockBackend } from '@/lib/mock-ipc';
 import { useCatalogStore } from '@/stores/catalog';
 import { useConnectionsStore } from '@/stores/connections';
@@ -11,11 +14,14 @@ import { useExtractStore } from '@/stores/extract';
 import { useHistoryStore } from '@/stores/history';
 import { useJobsStore } from '@/stores/jobs';
 import { useSettingsStore } from '@/stores/settings';
+import { useUiStore } from '@/stores/ui';
+import { useToastStore } from '@/lib/toast';
 import { resetStores } from '@/test/stores';
 import { tableKey } from '@/lib/utils';
-import { MonitorPanel } from '@/components/monitor/MonitorPanel';
+import { ActivityPanel } from '@/components/monitor/ActivityPanel';
+import { ms } from '@/components/monitor/strings';
 import { TooltipProvider } from '@/components/ui';
-import { AppEvents } from './AppEvents';
+import { AppEvents, menuActionId } from './AppEvents';
 
 // The real commands (over the mock backend), with `jobGet` wrapped so a test can hold one call.
 vi.mock('@/lib/commands', async (importOriginal) => {
@@ -40,6 +46,8 @@ describe('AppEvents', () => {
   it('bootstraps the stores and re-attaches a job that was already running (job_list)', async () => {
     // Started before the UI mounted, as after a window reload: its earlier events were missed.
     const jobId = await exportStart(req, []);
+    // A history page some panel already loaded (sidebar 기록, palette): reloaded after the export.
+    await useHistoryStore.getState().load('c-prod');
     render(<AppEvents />);
 
     await waitFor(() => expect(useJobsStore.getState().jobs[jobId]).toBeDefined());
@@ -52,7 +60,9 @@ describe('AppEvents', () => {
     const entry = useJobsStore.getState().jobs[jobId];
     expect(entry.summary.result?.files[0]).toMatch(/reattach\.csv$/);
     expect(entry.logs.length).toBeGreaterThan(0);
-    await waitFor(() => expect(useHistoryStore.getState().entries.some((h) => h.jobId === jobId)).toBe(true));
+    await waitFor(() => expect(useHistoryStore.getState().lists['c-prod'].entries.some((h) => h.jobId === jobId)).toBe(true));
+    // No legacy output patch at bootstrap: no query document was created behind the UI's back.
+    expect(Object.keys(useExtractStore.getState().docs)).toEqual([]);
   });
 
   it('fetches the preflight report when a known job enters warned so it can be acknowledged', async () => {
@@ -68,12 +78,12 @@ describe('AppEvents', () => {
     // Mounted only while the job waits (no events flow then), so no update escapes act().
     const panel = render(
       <TooltipProvider>
-        <MonitorPanel />
+        <ActivityPanel variant="inspector" />
       </TooltipProvider>,
     );
     const card = screen.getByRole('article', { name: new RegExp(stateLabel('warned')) });
-    expect(within(card).getByText(`1 ${t('extract.warnings')}`)).toBeInTheDocument();
-    const review = within(card).getByRole('button', { name: t('monitor.acknowledge') });
+    expect(within(card).getByText(ms('warned', { n: 1 }))).toBeInTheDocument();
+    const review = within(card).getByRole('button', { name: ms('review') });
     expect(review).toBeEnabled();
     await user.click(review);
     const dialog = useExtractStore.getState().preflightDialog;
@@ -131,5 +141,84 @@ describe('AppEvents', () => {
     useCatalogStore.getState().setCounting('c-prod', ref, 'cnt-gone');
     mockBackend.emit('job:done', { jobId: 'cnt-gone', state: 'failed', error: { code: 'QUERY', message: 'canceling statement due to statement timeout' } });
     await waitFor(() => expect(useCatalogStore.getState().counting[tableKey('c-prod', ref)]).toBeUndefined());
+  });
+
+  it('toasts a local copy/export completion, and stays silent for a job another window owns', async () => {
+    render(<AppEvents />);
+    await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+    const now = new Date().toISOString();
+    // A copy job this window started (claimed): its completion toast shows here (db-copy.md 1.1).
+    const mine = 'cp-mine';
+    useJobsStore.getState().upsertSummary({ id: mine, kind: 'copy', state: 'running', connId: 'c-prod', connName: 'prod', label: 'prod → mysql8', startedAt: now });
+    useJobsStore.getState().addLocal([mine]);
+    mockBackend.emit('job:done', { jobId: mine, state: 'done' });
+    await waitFor(() => expect(useToastStore.getState().toasts.some((t) => t.message.includes('prod → mysql8'))).toBe(true));
+
+    // A job another window owns (not local) raises no toast in this window.
+    const other = 'cp-other';
+    useJobsStore.getState().upsertSummary({ id: other, kind: 'copy', state: 'running', connId: 'c-prod', connName: 'prod', label: 'owned-elsewhere', startedAt: now });
+    mockBackend.emit('job:done', { jobId: other, state: 'done' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useToastStore.getState().toasts.some((t) => t.message.includes('owned-elsewhere'))).toBe(false);
+  });
+
+  it('coalesces a burst of connections:changed into a single reload', async () => {
+    render(<AppEvents />);
+    await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+    const connListCalls = () => mockBackend.calls.filter((c) => c === 'conn_list').length;
+    const before = connListCalls();
+    mockBackend.emit('connections:changed', null);
+    mockBackend.emit('connections:changed', null);
+    mockBackend.emit('connections:changed', null);
+    await waitFor(() => expect(connListCalls()).toBe(before + 1), { timeout: 1000 });
+    // No further reload escapes the coalescing window.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(connListCalls()).toBe(before + 1);
+  });
+
+  it('routes macOS menu items (menu:action) to runAction; disabled and unknown ids are no-ops', async () => {
+    registerBuiltinActions();
+    render(<AppEvents />);
+    await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+    mockBackend.emit('menu:action', 'app.settings');
+    await waitFor(() => expect(useUiStore.getState().settingsOpen).toBe(true));
+    mockBackend.emit('menu:action', { id: 'app.about' });
+    await waitFor(() => expect(useUiStore.getState().aboutOpen).toBe(true));
+    // tabs.close is disabled on Welcome; an unknown id only logs.
+    mockBackend.emit('menu:action', 'tabs.close');
+    mockBackend.emit('menu:action', 'no.such.action');
+    await waitFor(() => expect(useUiStore.getState().palette.open).toBe(false));
+  });
+
+  it('leaves app:quit-requested to the windows store: one quit question with AppEvents mounted', async () => {
+    const asked: string[] = [];
+    setConfirmHandler((o) => {
+      asked.push(o.body ?? '');
+      return Promise.resolve(false);
+    });
+    try {
+      render(<AppEvents />);
+      await initWindows();
+      await waitFor(() => expect(useConnectionsStore.getState().loaded).toBe(true));
+      mockBackend.emitTo('main', 'app:quit-requested', { jobs: 1 });
+      await waitFor(() => expect(asked).toHaveLength(1));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(asked).toEqual([wins('quitBody', { n: 1 })]);
+      expect(mockBackend.calls).not.toContain('app_quit_confirmed');
+    } finally {
+      setConfirmHandler(null);
+      resetWindowsInit();
+    }
+  });
+});
+
+describe('menuActionId', () => {
+  it('reads a plain id or an object payload', () => {
+    expect(menuActionId('tabs.close')).toBe('tabs.close');
+    expect(menuActionId({ id: 'query.run' })).toBe('query.run');
+    expect(menuActionId({ action: 'app.about' })).toBe('app.about');
+    expect(menuActionId('')).toBeNull();
+    expect(menuActionId(42)).toBeNull();
+    expect(menuActionId(null)).toBeNull();
   });
 });

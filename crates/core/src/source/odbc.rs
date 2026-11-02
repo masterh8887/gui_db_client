@@ -883,6 +883,8 @@ enum Cmd {
     Query {
         sql: String,
         batch_rows: usize,
+        /// Byte limit of one Arrow batch (`Query::batch_bytes`).
+        max_bytes: usize,
         cancel: CancellationToken,
         slot: Arc<CancelSlot>,
         /// Dropped when the query is finished; ends the cancel watcher.
@@ -952,8 +954,8 @@ fn actor_main(conn_str: String, login_timeout_sec: u32, ready: oneshot::Sender<R
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             Cmd::Close => break,
-            Cmd::Query { sql, batch_rows, cancel, slot, done, mut reply } => {
-                let outcome = catch_unwind(AssertUnwindSafe(|| run_stream(&conn, &sql, batch_rows, &cancel, &slot, &mut reply)));
+            Cmd::Query { sql, batch_rows, max_bytes, cancel, slot, done, mut reply } => {
+                let outcome = catch_unwind(AssertUnwindSafe(|| run_stream(&conn, &sql, (batch_rows, max_bytes), &cancel, &slot, &mut reply)));
                 match outcome {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => reply.fail(e),
@@ -988,7 +990,14 @@ fn actor_main(conn_str: String, login_timeout_sec: u32, ready: oneshot::Sender<R
 }
 
 /// Execute `sql` on a fresh statement and stream the result set as Arrow batches.
-fn run_stream(conn: &Connection<'_>, sql: &str, batch_rows: usize, cancel: &CancellationToken, slot: &CancelSlot, reply: &mut QueryReply) -> Result<()> {
+fn run_stream(
+    conn: &Connection<'_>,
+    sql: &str,
+    (batch_rows, max_bytes): (usize, usize),
+    cancel: &CancellationToken,
+    slot: &CancelSlot,
+    reply: &mut QueryReply,
+) -> Result<()> {
     if cancel.is_cancelled() {
         return Err(CoreError::Cancelled);
     }
@@ -1028,7 +1037,7 @@ fn run_stream(conn: &Connection<'_>, sql: &str, batch_rows: usize, cancel: &Canc
     // The schema is known: let `stream()` return while rows start flowing.
     reply.schema(Ok(Some(schema.clone())));
 
-    let mut batcher = ArrowBatcher::new(schema, kinds);
+    let mut batcher = ArrowBatcher::with_limits(schema, kinds, BATCH_ROWS, max_bytes);
     let mut scratch = String::new();
     let mut warn = Warnings::default();
     let ncols = plans.len();
@@ -1445,6 +1454,7 @@ impl Source for OdbcDatabase {
         self.send(Cmd::Query {
             sql: q.sql.clone(),
             batch_rows,
+            max_bytes: q.batch_bytes(),
             cancel: cancel.clone(),
             slot: slot.clone(),
             done: done_tx,
@@ -1453,7 +1463,7 @@ impl Source for OdbcDatabase {
         spawn_cancel_watcher(slot, cancel, done_rx);
         let schema = schema_rx.await.map_err(|_| CoreError::Internal("odbc connection thread dropped the query".into()))??;
         let stream = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        Ok(SourceStream { schema, stream: Box::pin(stream) })
+        Ok(SourceStream { schema, stream: Box::pin(stream), replaced: None })
     }
 
     /// ODBC has no portable EXPLAIN.
@@ -1463,6 +1473,10 @@ impl Source for OdbcDatabase {
 
     fn session_id(&self) -> Option<String> {
         None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn driver_id(&self) -> &'static str {

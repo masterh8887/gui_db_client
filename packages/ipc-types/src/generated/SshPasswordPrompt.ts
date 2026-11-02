@@ -4,4 +4,12 @@ export type SshPasswordPrompt = { promptId: string, host: string, user: string,
 /**
  * `password` or `passphrase`.
  */
-kind: string, };
+kind: string, 
+/**
+ * Connection whose tunnel asks (context for prompts raised in another window).
+ */
+connName?: string, 
+/**
+ * Label of the job that opened the tunnel, when a job did.
+ */
+jobLabel?: string, };

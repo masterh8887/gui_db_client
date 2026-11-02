@@ -1,8 +1,12 @@
-//! MySQL / MariaDB driver (mysql_async 0.36, binary protocol streaming).
+//! MySQL / MariaDB driver over mysql_async 0.36 (protocol 4.1: MySQL 4.1+ and MariaDB). Pre-4.1
+//! servers (3.23 / 4.0) are served by `mysql_legacy`; `mysql_dispatch` picks the client.
 //!
-//! * One `Conn` per [`MySqlDatabase`], kept in a `tokio::sync::Mutex<Option<Conn>>`. While an
-//!   extraction streams, the connection is moved into the reader task and the slot is empty
-//!   (catalog/monitor calls run on their own `bulkdb-ui` object, so they never collide).
+//! * One `Conn` per [`MySqlDatabase`], kept in a `tokio::sync::Mutex<Slot>`. While an
+//!   extraction streams, the connection is moved into the reader task (`Slot::Busy`; catalog and
+//!   monitor calls run on their own `bulkdb-ui` / `bulkdb-monitor` objects, so they never
+//!   collide). A connection that was killed or broke (`Slot::Gone`: a cancelled stream, a cancel
+//!   on 4.1 where only `KILL <id>` exists) is re-opened lazily by the next call, with the same
+//!   options and text plan.
 //! * Extraction runs as a server-side prepared statement: `conn.prep(sql)` ->
 //!   `conn.exec_iter(&stmt, ())` -> `result.stream::<Row>()` decoded row by row into
 //!   [`ArrowBatcher`]; a batch is cut at 64K rows / 8 MB and sent through a tiny bounded
@@ -10,63 +14,78 @@
 //!   `CLIENT_MULTI_STATEMENTS` (it cannot be switched off), so the text protocol would execute
 //!   `SELECT 1; DROP TABLE t` as two statements; `COM_STMT_PREPARE` accepts exactly one
 //!   statement, which makes the server itself the last line of defence behind `sqlguard`.
-//!   The extraction session is additionally `SET SESSION TRANSACTION READ ONLY`.
-//! * EXPLAIN runs over the text protocol (not every server can prepare `EXPLAIN` /
-//!   `ANALYZE`), so its SQL is first checked with [`has_statement_separator`] under the
-//!   session's `sql_mode` lexing rules.
-//! * Cancel: `KILL QUERY <connection id>` over a second short-lived connection, then the stream
-//!   ends with `Cancelled` and the (half-read) connection is dropped.
-//! * Session: `max_execution_time` (MySQL >= 5.7.8) / `max_statement_time` (MariaDB) and
-//!   `net_read_timeout` / `net_write_timeout`.
-//! * Probe: version, `innodb_buffer_pool_size` (RAM estimate x 1.33), `SHOW GRANTS` for write
-//!   privileges, flavour detection (MySQL vs MariaDB).
-//! * EXPLAIN: `EXPLAIN FORMAT=JSON` parsed into a [`PlanNode`] tree; `EXPLAIN ANALYZE`
-//!   (MySQL 8.0.18+) / `ANALYZE FORMAT=JSON` (MariaDB) when `analyze = true`.
+//!   Where the server supports it (5.6.5+ / MariaDB 10.0+) the extraction session is also
+//!   `SET SESSION TRANSACTION READ ONLY`.
+//! * Text encoding (design doc section 5): connect reads `@@character_set_server`,
+//!   `@@character_set_database` and `@@sql_mode`, picks a [`TextPlan`] from the `encoding`
+//!   field (`mysql_dispatch::plan_text`) and runs its session statements: `SET NAMES utf8mb4`
+//!   (`utf8` before 5.5.3), or for EUC-KR data the pass-through setup with
+//!   `character_set_results = NULL`. SQL is encoded with the plan's charset and sent as bytes;
+//!   on a pass-through connection every text column is decoded by its own collation id
+//!   (`SHOW COLLATION`), which reads CP949 stored in `latin1` columns correctly.
+//! * Old passwords: `allow_old_password = true` sets `secure_auth(false)`; otherwise a server
+//!   asking for `mysql_old_password` yields `AUTH` with [`OLD_PASSWORD_HINT`].
+//! * Probe, session settings, EXPLAIN, catalog and monitor are the version-aware shared
+//!   implementations over [`MysqlRawQuery`] (`mysql_common`, `catalog::mysql::generic`,
+//!   `monitor::mysql::generic`), which this driver implements over the text protocol.
+//! * Cancel: `KILL QUERY <connection id>` (5.0+) or `KILL <connection id>` (4.1, ends the
+//!   session) over a second short-lived connection ([`kill_sql`]), then the stream ends with
+//!   `Cancelled` and the (half-read) connection is dropped. The same happens when the
+//!   consumer goes away (the batch receiver is dropped after a sink failure, or `stream()`'s
+//!   future is dropped): every wait on the server (prepare, execute, next row) also races
+//!   `batch_tx.closed()`, so no reader task, socket or server query outlives the job.
 //!
 //! mysql_async 0.36 does not send connection attributes, so `program_name` cannot be set from
 //! the client. The extraction SQL is tagged with a leading `/* bulkdb-<job> */` comment instead,
-//! which the monitor can find in `processlist.info` when no session id is known.
+//! which the monitor can find in the process list when no session id is known.
 //!
 //! TLS: the workspace builds mysql_async with its default features, which include no TLS
-//! backend. mysql_async *panics* when TLS is requested without one, so the connect future is
-//! guarded with `catch_unwind`; `SslMode::Prefer` falls back to a plain connection and
-//! `Require` / `VerifyFull` report a clear `CONNECT` error until `native-tls-tls` is enabled.
+//! backend ([`TLS_BACKEND`] is `false`). A TLS attempt could only end right after the server
+//! greeting without a login packet, which MySQL counts toward `max_connect_errors` and which
+//! finally blocks the client host (design doc section 3). So, before any socket is opened,
+//! `Require` / `VerifyFull` are refused with a `CONNECT` error ([`check_tls_supported`]) and
+//! `Prefer` connects in clear text straight away. The connect future stays guarded with
+//! `catch_unwind` (mysql_async *panics* when TLS is requested without a backend).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
-use mysql_async::{Column, Conn, Opts, OptsBuilder, Params, Row, SslOpts, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use mysql_async::{Column, Conn, Opts, OptsBuilder, Row, SslOpts, Value};
+use tokio::sync::{mpsc, oneshot, Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use super::arrow_batch::{schema_from, ArrowBatcher, Cell, ColKind};
+use super::mysql_common::{
+    self, kill_sql, server_error_code, MetaColumn, MetaRows, MysqlCaps, MysqlRawQuery, ServerFacts, WriteSamples, ER_NO_SUCH_THREAD, ER_PARSE_ERROR, META_ROW_LIMIT,
+    OLD_PASSWORD_HINT,
+};
+use super::mysql_dispatch::{plan_text, MysqlConnOpts, TextPlan};
 use super::{Batch, ConnectParams, Database, Query, Source, SourceStream, SslMode};
+use crate::encoding::{decode_cell, repair_latin1_mojibake, Charset, CollationMap};
 use crate::error::{CoreError, Result};
 use crate::types::{PlanNode, PlanSummary, ServerInfo, SessionOpts, TableRef};
-use crate::{BATCH_BYTES, BATCH_ROWS};
+use crate::BATCH_ROWS;
 
 /// Binary charset number: columns with this collation carry bytes, not text.
 const BINARY_CHARSET: u16 = 63;
-/// How long a `KILL QUERY` side connection may take (connect + kill).
+/// How long a `KILL [QUERY]` side connection may take (connect + kill).
 const KILL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Depth of the internal reader -> pipeline channel (the pipeline has its own 8-deep channel).
 const READER_CHANNEL_DEPTH: usize = 2;
-/// Planner-only EXPLAIN limits (statement / metadata lock).
-const EXPLAIN_STATEMENT_TIMEOUT_MS: u64 = 15_000;
-const EXPLAIN_LOCK_TIMEOUT_S: u64 = 3;
-/// Monitor ring size for the `Sending to client` ratio.
-const WRITE_RING: usize = 10;
-/// `ER_PARSE_ERROR`: SQL syntax error.
-const ER_PARSE_ERROR: u16 = 1064;
-/// `ER_UNKNOWN_SYSTEM_VARIABLE`.
-const ER_UNKNOWN_SYSTEM_VARIABLE: u16 = 1193;
+/// Client-side packet limit (the server's own `max_allowed_packet` caps what it sends). Set in
+/// `Opts` together with `wait_timeout`, so mysql_async skips its post-connect
+/// `SELECT @@max_allowed_packet, @@wait_timeout` round trip.
+const CLIENT_MAX_ALLOWED_PACKET: usize = 1 << 30;
+const CLIENT_WAIT_TIMEOUT_S: usize = 28_800;
+/// First statement after the handshake (4.1+): version, default charsets and quoting rules.
+const CONNECT_FACTS_SQL: &[u8] = b"SELECT VERSION(), @@character_set_server, @@character_set_database, @@sql_mode";
 
 // ---------------------------------------------------------------------------------------------
 // Server version / flavour
@@ -147,28 +166,38 @@ impl ServerVersion {
 // Database object
 // ---------------------------------------------------------------------------------------------
 
+/// Where the connection of a [`MySqlDatabase`] is.
+enum Slot {
+    Idle(Conn),
+    /// Moved into a running extraction.
+    Busy,
+    /// Killed or broken: the next call opens a new one.
+    Gone,
+}
+
 pub struct MySqlDatabase {
+    /// Options of the successful connect (TLS choice, `secure_auth`), reused for side
+    /// connections and reconnects. Holds the password; never logged.
     opts: Opts,
-    conn: Arc<Mutex<Option<Conn>>>,
-    session_id: u32,
-    version: ServerVersion,
-    application_name: String,
-    database: Option<String>,
-    user: Option<String>,
-    host: String,
-    port: u16,
+    connect_timeout: Duration,
+    conn: Arc<Mutex<Slot>>,
+    /// Live connection id (a re-opened connection gets a new one).
+    session_id: Arc<AtomicU32>,
     /// Per job ring of "server is sending to the client" samples (see `monitor/mysql.rs`).
-    write_samples: std::sync::Mutex<HashMap<String, VecDeque<bool>>>,
+    write_samples: WriteSamples,
+    /// What the shared version-aware logic needs (`mysql_common::ServerFacts`).
+    facts: ServerFacts,
 }
 
 impl std::fmt::Debug for MySqlDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MySqlDatabase")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("database", &self.database)
-            .field("session_id", &self.session_id)
-            .field("version", &self.version.raw)
+            .field("host", &self.facts.host)
+            .field("port", &self.facts.port)
+            .field("database", &self.facts.database)
+            .field("session_id", &self.session_id.load(Ordering::Relaxed))
+            .field("version", &self.facts.version.raw)
+            .field("text_plan", &self.facts.plan)
             .finish()
     }
 }
@@ -190,237 +219,232 @@ impl ConnectFailure {
     }
 }
 
+const BUSY: &str = "connection is busy with a running extraction";
+
+fn conn_mut(slot: &mut Slot) -> Result<&mut Conn> {
+    match slot {
+        Slot::Idle(c) => Ok(c),
+        _ => Err(CoreError::Connect(BUSY.into())),
+    }
+}
+
 impl MySqlDatabase {
-    /// Connect, honouring `params.ssl`, then `SET NAMES utf8mb4` and read the server version.
+    /// Connect (honouring `params.ssl` and `allow_old_password`), read the server version,
+    /// default charsets and `sql_mode`, choose the [`TextPlan`] from the `encoding` field and run
+    /// its session statements (design doc section 4, "connect").
     pub async fn connect(params: &ConnectParams) -> Result<Self> {
+        let settings = MysqlConnOpts::from_params(params)?;
         let timeout = params.connect_timeout;
-        let (mut conn, opts) = match params.ssl {
-            SslMode::Disable => {
-                let o = build_opts(params, None);
+        let old = settings.allow_old_password;
+        // Nothing below may open a socket that is certain to fail right after the greeting
+        // (design doc section 3).
+        check_tls_supported(params)?;
+        let tls = match params.ssl {
+            SslMode::Disable => None,
+            // Without a TLS backend the TLS attempt would be dropped after the greeting before
+            // the clear-text retry: go to clear text directly.
+            SslMode::Prefer if !TLS_BACKEND => None,
+            SslMode::Prefer | SslMode::Require => Some(SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)),
+            SslMode::VerifyFull => Some(SslOpts::default()),
+        };
+        let (mut conn, opts) = match tls {
+            None => {
+                let o = build_opts(params, None, old);
                 (connect_with_timeout(o.clone(), timeout).await.map_err(ConnectFailure::into_core)?, o)
             }
-            SslMode::Prefer => {
-                let tls = build_opts(params, Some(SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)));
-                match connect_with_timeout(tls.clone(), timeout).await {
-                    Ok(c) => (c, tls),
-                    Err(ConnectFailure::Tls(reason)) => {
+            Some(ssl) => {
+                let o = build_opts(params, Some(ssl), old);
+                match connect_with_timeout(o.clone(), timeout).await {
+                    Ok(c) => (c, o),
+                    Err(ConnectFailure::Tls(reason)) if params.ssl == SslMode::Prefer => {
                         tracing::debug!("mysql {}:{}: TLS unavailable ({reason}); retrying without TLS", params.host, params.port);
-                        let plain = build_opts(params, None);
+                        let plain = build_opts(params, None, old);
                         (connect_with_timeout(plain.clone(), timeout).await.map_err(ConnectFailure::into_core)?, plain)
                     }
                     Err(other) => return Err(other.into_core()),
                 }
             }
-            SslMode::Require => {
-                let o = build_opts(params, Some(SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)));
-                (connect_with_timeout(o.clone(), timeout).await.map_err(ConnectFailure::into_core)?, o)
-            }
-            SslMode::VerifyFull => {
-                let o = build_opts(params, Some(SslOpts::default()));
-                (connect_with_timeout(o.clone(), timeout).await.map_err(ConnectFailure::into_core)?, o)
-            }
         };
 
-        conn.query_drop("SET NAMES utf8mb4").await.map_err(map_err)?;
-        let raw: Option<String> = conn.query_first("SELECT VERSION()").await.map_err(map_err)?;
-        let version = ServerVersion::parse(raw.as_deref().unwrap_or_default());
+        // Before any SET NAMES the results use the handshake collation (utf8 / utf8mb4); these
+        // values are ASCII on every server.
+        let head = query_meta(&mut conn, CONNECT_FACTS_SQL).await?;
+        let cell = |i: usize| head.raw(0, i).map(|b| String::from_utf8_lossy(b).trim().to_string()).filter(|s| !s.is_empty());
+        let version = ServerVersion::parse(&cell(0).unwrap_or_default());
+        let server_charset = cell(1);
+        let database_charset = cell(2);
+        let lex = cell(3).map(|m| LexMode::from_sql_mode(&m)).unwrap_or_default();
+        let (plan, note) = plan_text(settings.encoding, &version, false, server_charset.as_deref(), database_charset.as_deref());
+        if let Some(note) = &note {
+            tracing::info!("mysql {}:{}: {note}", params.host, params.port);
+        }
+        for stmt in plan.session_statements() {
+            conn.query_drop(stmt).await.map_err(map_err)?;
+        }
+        let mut collations = CollationMap::builtin();
+        if matches!(plan, TextPlan::PassThrough { .. }) {
+            match query_meta(&mut conn, b"SHOW COLLATION").await {
+                Ok(rows) => fill_collations(&mut collations, &rows),
+                Err(e) => tracing::warn!("mysql {}:{}: SHOW COLLATION failed ({e}); using the builtin collation table", params.host, params.port),
+            }
+        }
         let session_id = conn.id();
-        tracing::debug!("mysql connected to {}:{} ({}, {}) as connection {}", params.host, params.port, version.label(), version.raw, session_id);
+        tracing::debug!(
+            "mysql connected to {}:{} ({} {}, charset {} / {}) as connection {session_id}; {}",
+            params.host,
+            params.port,
+            version.label(),
+            version.raw,
+            server_charset.as_deref().unwrap_or("?"),
+            database_charset.as_deref().unwrap_or("?"),
+            plan.describe()
+        );
 
-        Ok(MySqlDatabase {
-            opts,
-            conn: Arc::new(Mutex::new(Some(conn))),
-            session_id,
+        let facts = ServerFacts {
+            caps: MysqlCaps::for_version(&version),
             version,
-            application_name: params.application_name.clone(),
-            database: params.database.clone().filter(|d| !d.is_empty()),
+            legacy_protocol: false,
+            session_id,
+            server_charset,
+            database_charset,
+            plan,
+            collations,
+            lex,
             user: params.user.clone(),
+            database: params.database.clone().filter(|d| !d.is_empty()),
+            application_name: params.application_name.clone(),
             host: params.host.clone(),
             port: params.port,
-            write_samples: std::sync::Mutex::new(HashMap::new()),
+        };
+        Ok(MySqlDatabase {
+            opts,
+            connect_timeout: timeout,
+            conn: Arc::new(Mutex::new(Slot::Idle(conn))),
+            session_id: Arc::new(AtomicU32::new(session_id)),
+            write_samples: WriteSamples::default(),
+            facts,
         })
     }
 
     pub fn version(&self) -> &ServerVersion {
-        &self.version
+        &self.facts.version
     }
 
     pub fn flavor(&self) -> Flavor {
-        self.version.flavor
+        self.facts.version.flavor
     }
 
     /// Database named in the connection (`None` when the account connected without one).
     pub fn current_database(&self) -> Option<&str> {
-        self.database.as_deref()
+        self.facts.database.as_deref()
     }
 
     pub fn application_name(&self) -> &str {
-        &self.application_name
+        &self.facts.application_name
     }
 
-    /// Record one monitor sample for `job_id` and return the fraction of the last ten samples
-    /// where the server was writing to the client.
-    pub(crate) fn record_write_sample(&self, job_id: &str, writing: bool) -> f32 {
-        let mut map = self.write_samples.lock().unwrap_or_else(|p| p.into_inner());
-        let ring = map.entry(job_id.to_string()).or_default();
-        ring.push_back(writing);
-        while ring.len() > WRITE_RING {
-            ring.pop_front();
-        }
-        let hits = ring.iter().filter(|w| **w).count();
-        hits as f32 / ring.len() as f32
+    /// How this connection encodes SQL and decodes text.
+    pub fn text_plan(&self) -> &TextPlan {
+        &self.facts.plan
     }
 
-    pub(crate) fn forget_write_samples(&self, job_id: &str) {
-        self.write_samples.lock().unwrap_or_else(|p| p.into_inner()).remove(job_id);
+    /// Connection options of this database (DB copy opens its own writer connections from them).
+    #[allow(dead_code)] // used by copy::target::mysql (owner copy-data, W1)
+    pub(crate) fn opts(&self) -> &Opts {
+        &self.opts
     }
 
     // --- connection helpers ------------------------------------------------------------------
 
-    /// Run `f` with the connection. Fails with `CONNECT` when the connection is streaming.
-    async fn with_conn<T, F>(&self, f: F) -> Result<T>
-    where
-        F: for<'c> FnOnce(&'c mut Conn) -> futures::future::BoxFuture<'c, Result<T>> + Send,
-        T: Send,
-    {
+    /// Lock the connection slot, re-opening a killed or broken connection first. `CONNECT`
+    /// while an extraction holds the connection.
+    async fn idle_conn(&self) -> Result<MutexGuard<'_, Slot>> {
         let mut guard = self.conn.lock().await;
-        let conn = guard.as_mut().ok_or_else(|| CoreError::Connect("connection is busy with a running extraction".into()))?;
-        f(conn).await
-    }
-
-    /// Text-protocol query returning all rows mapped through `f` (metadata only; never data).
-    pub(crate) async fn query_map<T, F>(&self, sql: &str, f: F) -> Result<Vec<T>>
-    where
-        F: FnMut(Row) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let sql = sql.to_string();
-        self.with_conn(move |c| Box::pin(async move { c.query_map(sql, f).await.map_err(map_err) })).await
-    }
-
-    /// Prepared query with parameters returning all rows mapped through `f` (metadata only).
-    pub(crate) async fn exec_map<T, F, P>(&self, sql: &str, params: P, f: F) -> Result<Vec<T>>
-    where
-        F: FnMut(Row) -> T + Send + 'static,
-        T: Send + 'static,
-        P: Into<Params> + Send,
-    {
-        let sql = sql.to_string();
-        let params: Params = params.into();
-        self.with_conn(move |c| Box::pin(async move { c.exec_map(sql, params, f).await.map_err(map_err) })).await
-    }
-
-    /// First row of a text-protocol query.
-    pub(crate) async fn query_first(&self, sql: &str) -> Result<Option<Row>> {
-        let sql = sql.to_string();
-        self.with_conn(move |c| Box::pin(async move { c.query_first(sql).await.map_err(map_err) })).await
-    }
-
-    /// First row of a prepared query.
-    pub(crate) async fn exec_first<P>(&self, sql: &str, params: P) -> Result<Option<Row>>
-    where
-        P: Into<Params> + Send,
-    {
-        let sql = sql.to_string();
-        let params: Params = params.into();
-        self.with_conn(move |c| Box::pin(async move { c.exec_first(sql, params).await.map_err(map_err) })).await
-    }
-
-    /// `INVALID` unless `sql` is a single statement under this session's quoting rules. Text that
-    /// is a single statement under every `sql_mode` passes without a round trip; otherwise the
-    /// session's `sql_mode` decides how quotes and backslashes are lexed.
-    pub(crate) async fn ensure_single_statement(&self, sql: &str) -> Result<()> {
-        if !may_have_statement_separator(sql) {
-            return Ok(());
+        match &*guard {
+            Slot::Idle(_) => {}
+            Slot::Busy => return Err(CoreError::Connect(BUSY.into())),
+            Slot::Gone => *guard = Slot::Idle(self.reopen().await?),
         }
-        let mode = match self.query_first("SELECT @@SESSION.sql_mode").await? {
-            Some(row) => LexMode::from_sql_mode(&row_str(&row, 0).unwrap_or_default()),
-            None => LexMode::default(),
-        };
-        if has_statement_separator(sql, mode) {
-            return Err(CoreError::Invalid("the SQL must be a single statement: a ';' separates it into several, which MySQL would run one after the other".into()));
+        Ok(guard)
+    }
+
+    /// A new connection with the same options and text plan (after a kill or a broken socket).
+    async fn reopen(&self) -> Result<Conn> {
+        let mut conn = connect_with_timeout(self.opts.clone(), self.connect_timeout).await.map_err(ConnectFailure::into_core)?;
+        for stmt in self.facts.plan.session_statements() {
+            conn.query_drop(stmt).await.map_err(map_err)?;
         }
-        Ok(())
-    }
-
-    /// Statement without a result (`SET ...`, `KILL ...`).
-    pub(crate) async fn query_drop(&self, sql: &str) -> Result<()> {
-        let sql = sql.to_string();
-        self.with_conn(move |c| Box::pin(async move { c.query_drop(sql).await.map_err(map_err) })).await
-    }
-
-    /// Cancellable `SELECT` returning one row: on cancel the statement is killed from a side
-    /// connection and `Cancelled` is returned. Used by `exact_count`.
-    pub(crate) async fn query_first_cancellable(&self, sql: &str, cancel: CancellationToken) -> Result<Option<Row>> {
-        let sql = sql.to_string();
-        let opts = self.opts.clone();
-        let id = self.session_id;
-        self.with_conn(move |c| {
-            Box::pin(async move {
-                let fut = c.query_first::<Row, _>(sql);
-                tokio::pin!(fut);
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        if let Err(e) = kill_query(&opts, id).await {
-                            tracing::warn!("mysql: KILL QUERY {id} failed: {e}");
-                        }
-                        // Let the server interrupt the statement so the connection stays clean.
-                        let _ = tokio::time::timeout(KILL_TIMEOUT, &mut fut).await;
-                        Err(CoreError::Cancelled)
-                    }
-                    r = &mut fut => r.map_err(map_err),
-                }
-            })
-        })
-        .await
-    }
-
-    // --- EXPLAIN helpers ---------------------------------------------------------------------
-
-    /// Save, shorten and later restore the session timeouts around a planner-only EXPLAIN.
-    async fn explain_with_short_timeouts(&self, explain_sql: &str) -> Result<Vec<String>> {
-        let flavor = self.version.flavor;
-        let supports_met = self.version.supports_max_execution_time();
-        let sql = explain_sql.to_string();
-        self.with_conn(move |c| {
-            Box::pin(async move {
-                let saved_lock: Option<u64> = c.query_first::<Row, _>("SELECT @@session.lock_wait_timeout").await.ok().flatten().and_then(|r| row_u64(&r, 0));
-                let saved_stmt: Option<String> = match flavor {
-                    Flavor::MariaDb => c.query_first::<Row, _>("SELECT @@session.max_statement_time").await.ok().flatten().and_then(|r| row_str(&r, 0)),
-                    Flavor::MySql if supports_met => c.query_first::<Row, _>("SELECT @@session.max_execution_time").await.ok().flatten().and_then(|r| row_str(&r, 0)),
-                    Flavor::MySql => None,
-                };
-                let _ = c.query_drop(format!("SET SESSION lock_wait_timeout = {EXPLAIN_LOCK_TIMEOUT_S}")).await;
-                match flavor {
-                    Flavor::MariaDb => {
-                        let _ = c.query_drop(format!("SET SESSION max_statement_time = {}", EXPLAIN_STATEMENT_TIMEOUT_MS as f64 / 1000.0)).await;
-                    }
-                    Flavor::MySql if supports_met => {
-                        let _ = c.query_drop(format!("SET SESSION max_execution_time = {EXPLAIN_STATEMENT_TIMEOUT_MS}")).await;
-                    }
-                    Flavor::MySql => {}
-                }
-                let out = c.query_map(sql, |row: Row| explain_row_text(&row)).await.map_err(map_err);
-                if let Some(v) = saved_lock {
-                    let _ = c.query_drop(format!("SET SESSION lock_wait_timeout = {v}")).await;
-                }
-                if let Some(v) = saved_stmt {
-                    let stmt = match flavor {
-                        Flavor::MariaDb => format!("SET SESSION max_statement_time = {v}"),
-                        Flavor::MySql => format!("SET SESSION max_execution_time = {v}"),
-                    };
-                    let _ = c.query_drop(stmt).await;
-                }
-                out
-            })
-        })
-        .await
+        self.session_id.store(conn.id(), Ordering::Relaxed);
+        tracing::debug!("mysql {}:{}: reconnected as connection {}", self.facts.host, self.facts.port, conn.id());
+        Ok(conn)
     }
 }
 
-/// Build `Opts` for `params` with an optional TLS configuration.
-fn build_opts(params: &ConnectParams, ssl: Option<SslOpts>) -> Opts {
+/// `SHOW COLLATION` (`Collation, Charset, Id, ...`) -> collation id -> charset.
+fn fill_collations(map: &mut CollationMap, rows: &MetaRows) {
+    let (Some(c_charset), Some(c_id)) = (rows.col("Charset"), rows.col("Id")) else { return };
+    for r in 0..rows.len() {
+        let id = rows.u64(r, c_id).and_then(|v| u16::try_from(v).ok());
+        let name = rows.raw(r, c_charset).map(String::from_utf8_lossy);
+        if let (Some(id), Some(name)) = (id, name) {
+            map.insert_named(id, &name);
+        }
+    }
+}
+
+/// Text-protocol query with every row read as raw bytes plus the column collation ids
+/// (metadata only, never table data; at most [`META_ROW_LIMIT`] rows). Further result sets,
+/// which a single statement never has, are drained.
+async fn query_meta(conn: &mut Conn, sql: &[u8]) -> Result<MetaRows> {
+    let result = conn.query_iter(sql).await.map_err(map_err)?;
+    let columns: Vec<MetaColumn> = result.columns_ref().iter().map(|c| MetaColumn { name: c.name_str().into_owned(), collation: Some(c.character_set()) }).collect();
+    let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    let mut overflow = false;
+    result
+        .for_each_and_drop(|mut row| {
+            if rows.len() >= META_ROW_LIMIT {
+                overflow = true;
+                return;
+            }
+            let cells = (0..row.len())
+                .map(|i| match row.take::<Value, usize>(i) {
+                    Some(Value::Bytes(b)) => Some(b),
+                    Some(Value::NULL) | None => None,
+                    Some(other) => value_str(Some(&other)).map(String::into_bytes),
+                })
+                .collect();
+            rows.push(cells);
+        })
+        .await
+        .map_err(map_err)?;
+    if overflow {
+        return Err(CoreError::Internal(format!("a metadata query returned more than {META_ROW_LIMIT} rows")));
+    }
+    Ok(MetaRows { columns, rows })
+}
+
+/// Whether mysql_async is built with a TLS backend (its `native-tls-tls` / `rustls-tls`
+/// feature). The workspace enables neither; set this to `true` together with that feature.
+pub const TLS_BACKEND: bool = false;
+
+/// Refuse `sslmode=require` / `verify-full` before a socket is opened when this build cannot do
+/// TLS: such a connect would always fail right after the server greeting without a login
+/// packet, and MySQL counts each of those toward `max_connect_errors` for the client host
+/// (design doc section 3). `mysql_dispatch::open` also runs it for `protocol=auto`, since the
+/// pre-4.1 client never has TLS either.
+pub fn check_tls_supported(params: &ConnectParams) -> Result<()> {
+    if !TLS_BACKEND && matches!(params.ssl, SslMode::Require | SslMode::VerifyFull) {
+        return Err(CoreError::Connect(
+            "TLS is not available: this build of the MySQL driver has no TLS backend (and the pre-4.1 client none at all); set sslmode to prefer or disable, or use an SSH tunnel"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build `Opts` for `params` with an optional TLS configuration. `allow_old_password` turns
+/// mysql_async's `secure_auth` off, so a 4.1 - 5.7.4 account with a pre-4.1 hash can log in.
+fn build_opts(params: &ConnectParams, ssl: Option<SslOpts>, allow_old_password: bool) -> Opts {
     let builder = OptsBuilder::default()
         .ip_or_hostname(params.host.clone())
         .tcp_port(params.port)
@@ -431,6 +455,9 @@ fn build_opts(params: &ConnectParams, ssl: Option<SslOpts>) -> Opts {
         .tcp_nodelay(true)
         .prefer_socket(false)
         .stmt_cache_size(0usize)
+        .secure_auth(!allow_old_password)
+        .max_allowed_packet(Some(CLIENT_MAX_ALLOWED_PACKET))
+        .wait_timeout(Some(CLIENT_WAIT_TIMEOUT_S))
         .ssl_opts(ssl);
     Opts::from(builder)
 }
@@ -484,23 +511,25 @@ fn is_tls_error(e: &mysql_async::Error) -> bool {
     }
 }
 
-/// `KILL QUERY <id>` over a fresh short-lived connection built from the same options.
-pub(crate) async fn kill_query(opts: &Opts, id: u32) -> Result<()> {
+/// [`kill_sql`] (`KILL QUERY <id>` on 5.0+, `KILL <id>` on 4.1) over a fresh short-lived
+/// connection built from the same options. `ER_NO_SUCH_THREAD` (already finished) is success.
+pub(crate) async fn kill_with(opts: &Opts, caps: &MysqlCaps, id: u32) -> Result<()> {
     let opts = opts.clone();
+    let sql = kill_sql(caps, id);
+    let label = sql.clone();
     let work = async move {
         let mut side = Conn::new(opts).await.map_err(map_err)?;
-        let r = side.query_drop(format!("KILL QUERY {id}")).await;
+        let r = side.query_drop(sql).await;
         let _ = side.disconnect().await;
         match r {
             Ok(()) => Ok(()),
-            // 1094: unknown thread id -> the statement already finished.
-            Err(mysql_async::Error::Server(ref s)) if s.code == 1094 => Ok(()),
+            Err(mysql_async::Error::Server(ref s)) if s.code == ER_NO_SUCH_THREAD => Ok(()),
             Err(e) => Err(map_err(e)),
         }
     };
     match tokio::time::timeout(KILL_TIMEOUT, work).await {
         Ok(r) => r,
-        Err(_) => Err(CoreError::Timeout(format!("KILL QUERY {id} did not complete within {} s", KILL_TIMEOUT.as_secs()))),
+        Err(_) => Err(CoreError::Timeout(format!("{label} did not complete within {} s", KILL_TIMEOUT.as_secs()))),
     }
 }
 
@@ -508,19 +537,19 @@ pub(crate) async fn kill_query(opts: &Opts, id: u32) -> Result<()> {
 // Error mapping
 // ---------------------------------------------------------------------------------------------
 
-/// Map a driver error onto `CoreError`. Server codes: 1317 interrupted -> `Cancelled`,
-/// 3024 (`max_execution_time`) / 1969 (MariaDB `max_statement_time`) -> `Timeout`,
-/// 1045 / 1044 / 1698 -> `Auth`, 2002 / 2003 / 2013 and I/O -> `Connect`, others -> `Query`.
+/// Map a driver error onto `CoreError`. Server codes go through
+/// [`mysql_common::map_server_error`], the same table as the pre-4.1 client: 1317 interrupted
+/// -> `Cancelled`, 3024 (`max_execution_time`) / 1969 (MariaDB `max_statement_time`) ->
+/// `Timeout`, 1045 / 1044 / 1698 and 1275 (secure_auth refuses an old hash) -> `Auth`, 1129
+/// (host blocked, also when sent instead of the greeting) / 1130 / 1040 / 2002 / 2003 / 2006
+/// / 2013 -> `Connect` (1129 / 1130 / 1275 with a hint), others -> `Query`. I/O -> `Connect`.
+/// A server that asks for `mysql_old_password` while `allow_old_password` is off -> `Auth`
+/// with [`OLD_PASSWORD_HINT`].
 pub fn map_err(e: mysql_async::Error) -> CoreError {
     use mysql_async::{DriverError, Error};
     match e {
-        Error::Server(s) => match s.code {
-            1317 => CoreError::Cancelled,
-            3024 | 1969 => CoreError::Timeout(s.message),
-            1045 | 1044 | 1698 => CoreError::Auth(format!("{} ({})", s.message, s.code)),
-            2002 | 2003 | 2013 | 2006 => CoreError::Connect(format!("{} ({})", s.message, s.code)),
-            code => CoreError::Query { code: Some(code.to_string()), msg: format!("{} (error {code}, SQLSTATE {})", s.message, s.state) },
-        },
+        // An ERR sent instead of the greeting carries no SQLSTATE.
+        Error::Server(s) => mysql_common::map_server_error(s.code, Some(s.state.as_str()).filter(|st| !st.is_empty()), s.message),
         Error::Io(io) => CoreError::Connect(io.to_string()),
         Error::Driver(d) => match d {
             DriverError::FromValue { .. } | DriverError::FromRow { .. } => CoreError::Internal(format!("mysql value conversion: {d}")),
@@ -529,6 +558,7 @@ pub fn map_err(e: mysql_async::Error) -> CoreError {
             DriverError::StmtParamsMismatch { .. } | DriverError::MissingNamedParam { .. } | DriverError::MixedParams | DriverError::NamedParamsForPositionalQuery => {
                 CoreError::Invalid(format!("the SQL contains placeholders (`?` or `:name`) but no parameters are bound: {d}"))
             }
+            DriverError::MysqlOldPasswordDisabled => CoreError::Auth(OLD_PASSWORD_HINT.to_string()),
             DriverError::ConnectionClosed | DriverError::PoolDisconnected | DriverError::PacketOutOfOrder | DriverError::UnexpectedPacket { .. } => {
                 CoreError::Connect(d.to_string())
             }
@@ -539,16 +569,8 @@ pub fn map_err(e: mysql_async::Error) -> CoreError {
     }
 }
 
-/// Server error code if `e` is one (used to ignore `unknown system variable` and friends).
-fn server_code(e: &CoreError) -> Option<u16> {
-    match e {
-        CoreError::Query { code: Some(c), .. } => c.parse().ok(),
-        _ => None,
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
-// Value helpers (metadata rows)
+// Value helpers
 // ---------------------------------------------------------------------------------------------
 
 /// Render any value as text (NULL -> None).
@@ -563,28 +585,6 @@ pub(crate) fn value_str(v: Option<&Value>) -> Option<String> {
         Value::Date(y, m, d, h, i, s, us) => Some(format_datetime(*y, *m, *d, *h, *i, *s, *us)),
         Value::Time(neg, days, h, i, s, us) => Some(format_time(*neg, *days, *h, *i, *s, *us)),
     }
-}
-
-pub(crate) fn value_u64(v: Option<&Value>) -> Option<u64> {
-    match v? {
-        Value::Int(i) => u64::try_from(*i).ok(),
-        Value::UInt(u) => Some(*u),
-        Value::Float(f) if *f >= 0.0 => Some(*f as u64),
-        Value::Double(d) if *d >= 0.0 => Some(*d as u64),
-        Value::Bytes(b) => {
-            let s = std::str::from_utf8(b).ok()?.trim();
-            s.parse::<u64>().ok().or_else(|| s.parse::<f64>().ok().filter(|f| *f >= 0.0).map(|f| f as u64))
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn row_str(row: &Row, i: usize) -> Option<String> {
-    value_str(row.as_ref(i))
-}
-
-pub(crate) fn row_u64(row: &Row, i: usize) -> Option<u64> {
-    value_u64(row.as_ref(i))
 }
 
 fn format_datetime(y: u16, m: u8, d: u8, h: u8, i: u8, s: u8, us: u32) -> String {
@@ -674,7 +674,7 @@ pub enum ValueParser {
 /// * `FLOAT` / `DOUBLE` -> `Float64`
 /// * `DECIMAL` -> `Decimal128` when the precision fits 38 digits, else `Utf8`
 /// * `DATE` -> `Date32`, `DATETIME` / `TIMESTAMP` -> naive microsecond timestamp, `TIME` -> `Utf8`
-/// * `BIT` -> `Int64`
+/// * `BIT` -> `Int64` (`BIT(64)` values above `i64::MAX` keep their bits: read them as `u64`)
 /// * strings / blobs with the binary charset (63: `BINARY`, `VARBINARY`, `BLOB`, `GEOMETRY`)
 ///   -> `Binary`, every other string, `JSON`, `ENUM`, `SET` -> `Utf8`
 pub fn column_kind(col: &Column) -> (ColKind, ValueParser) {
@@ -750,9 +750,10 @@ impl ValueParser {
             },
             ValueParser::Bit => match v {
                 Value::Int(i) => Ok(Cell::I64(*i)),
-                Value::UInt(u) => i64::try_from(*u).map(Cell::I64).map_err(|_| CoreError::Internal(format!("column {col}: BIT value {u} does not fit an i64"))),
+                // BIT(64) can exceed i64::MAX: keep the 64 bits (consumers reinterpret as u64).
+                Value::UInt(u) => Ok(Cell::I64(*u as i64)),
                 Value::Bytes(b) => {
-                    parse_bit(b).map(Cell::I64).ok_or_else(|| CoreError::Internal(format!("column {col}: BIT value of {} bytes does not fit an i64", b.len())))
+                    parse_bit(b).map(Cell::I64).ok_or_else(|| CoreError::Internal(format!("column {col}: BIT value of {} bytes is longer than 64 bits", b.len())))
                 }
                 other => Err(CoreError::Internal(format!("column {col}: unexpected {other:?} for a BIT column"))),
             },
@@ -839,12 +840,15 @@ impl ValueParser {
     }
 }
 
-fn parse_i64(b: &[u8]) -> Option<i64> {
+pub(crate) fn parse_i64(b: &[u8]) -> Option<i64> {
     std::str::from_utf8(b).ok()?.trim().parse::<i64>().ok()
 }
 
-/// `BIT(n)` arrives as up to 8 big-endian bytes.
-fn parse_bit(b: &[u8]) -> Option<i64> {
+/// `BIT(n)` arrives as up to 8 big-endian bytes. The 64 bits are kept as they are: a `BIT(64)`
+/// value with the top bit set becomes a negative `i64` whose bits are the unsigned value (the
+/// Arrow column is `Int64`; consumers that need the BIT value read it as `u64`). `None` only for
+/// more than 8 bytes.
+pub(crate) fn parse_bit(b: &[u8]) -> Option<i64> {
     if b.len() > 8 {
         return None;
     }
@@ -852,7 +856,7 @@ fn parse_bit(b: &[u8]) -> Option<i64> {
     for byte in b {
         v = (v << 8) | *byte as u64;
     }
-    i64::try_from(v).ok()
+    Some(v as i64)
 }
 
 fn scale_int(v: i128, scale: i8) -> Option<i128> {
@@ -898,7 +902,7 @@ pub fn parse_decimal(b: &[u8], scale: i8) -> Option<i128> {
     Some(if neg { -v } else { v })
 }
 
-fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i32> {
+pub(crate) fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i32> {
     if y == 0 && m == 0 && d == 0 {
         return None;
     }
@@ -906,7 +910,7 @@ fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i32> {
     Some(super::arrow_batch::days_from_date(date))
 }
 
-fn ymdhms_to_micros(y: i32, m: u32, d: u32, h: u32, i: u32, s: u32, us: u32) -> Option<i64> {
+pub(crate) fn ymdhms_to_micros(y: i32, m: u32, d: u32, h: u32, i: u32, s: u32, us: u32) -> Option<i64> {
     if y == 0 && m == 0 && d == 0 {
         return None;
     }
@@ -1140,46 +1144,88 @@ pub fn tag_like_pattern(application_name: &str) -> String {
 // Source
 // ---------------------------------------------------------------------------------------------
 
+/// How result text is decoded (from the connection's [`ServerFacts`]).
+struct TextDecode {
+    plan: TextPlan,
+    collations: CollationMap,
+}
+
+impl TextDecode {
+    /// Charset to decode a text column with when it is not UTF-8 already (`None`: the bytes are
+    /// UTF-8 or binary and go to the batcher untouched).
+    fn transcode(&self, col: &Column, parser: ValueParser) -> Option<Charset> {
+        if parser != ValueParser::Text {
+            return None;
+        }
+        match self.plan.column_charset(Some(col.character_set()), &self.collations) {
+            cs @ (Charset::EucKr | Charset::Latin1) => Some(cs),
+            Charset::Utf8 | Charset::Binary => None,
+        }
+    }
+
+    /// Column name as shown in the output: metadata is UTF-8 (the data dictionary), with the
+    /// latin1 double-encoding repaired on a `PassThrough { latin1, EUC-KR }` connection.
+    fn column_name(&self, col: &Column) -> String {
+        let name = col.name_str().into_owned();
+        if self.plan.repairs_metadata() {
+            return repair_latin1_mojibake(&name, self.plan.sql_charset()).unwrap_or(name);
+        }
+        name
+    }
+}
+
 /// Everything the reader task needs besides the connection.
 struct StreamCtx {
     opts: Opts,
+    caps: MysqlCaps,
     session_id: u32,
-    slot: Arc<Mutex<Option<Conn>>>,
+    slot: Arc<Mutex<Slot>>,
     cancel: CancellationToken,
     max_rows: usize,
+    /// Byte limit of one batch (`Query::batch_bytes`).
+    max_bytes: usize,
+    /// U+FFFD produced by decoding (`SourceStream.replaced`).
+    replaced: Arc<AtomicU64>,
+    text: TextDecode,
+    /// The SQL as the user wrote it (UTF-8), for error messages.
+    sql_text: String,
 }
 
 enum Step {
     Row(Row),
     End,
     Fail(mysql_async::Error),
+    /// The job was cancelled or the consumer dropped the stream.
     Cancel,
 }
 
 /// Reader task body: runs the query, streams rows into batches and hands the connection back
-/// to the slot when the result set was fully drained.
-async fn stream_task(mut conn: Conn, sql: String, ctx: StreamCtx, schema_tx: oneshot::Sender<Result<SchemaRef>>, batch_tx: mpsc::Sender<Result<Batch>>) {
+/// to the slot when the result set was fully drained (a half-read one is dropped and the slot
+/// marked `Gone`, so the next call reconnects).
+async fn stream_task(mut conn: Conn, sql: Vec<u8>, ctx: StreamCtx, schema_tx: oneshot::Sender<Result<SchemaRef>>, batch_tx: mpsc::Sender<Result<Batch>>) {
     let mut schema_tx = Some(schema_tx);
     let mut clean = true;
     let outcome = run_query(&mut conn, &sql, &ctx, &mut schema_tx, &batch_tx, &mut clean).await;
     match outcome {
         Ok(()) if clean => {
-            *ctx.slot.lock().await = Some(conn);
+            *ctx.slot.lock().await = Slot::Idle(conn);
         }
         Ok(()) => {
             // Every row was delivered but the connection could not be tidied up (closing the
             // prepared statement failed): do not hand a broken connection back.
             drop(conn);
+            *ctx.slot.lock().await = Slot::Gone;
         }
         Err(e) => {
             // Settle the connection before reporting, so a caller that reacts to the error by
             // using this database again (EXPLAIN, another stream) finds it back in its slot.
             if clean {
                 // The server answered with an error before any row: the connection is usable.
-                *ctx.slot.lock().await = Some(conn);
+                *ctx.slot.lock().await = Slot::Idle(conn);
             } else {
                 // Half-read result set: closing the socket makes the server abort the statement.
                 drop(conn);
+                *ctx.slot.lock().await = Slot::Gone;
             }
             if let Some(tx) = schema_tx.take() {
                 let _ = tx.send(Err(e));
@@ -1191,8 +1237,8 @@ async fn stream_task(mut conn: Conn, sql: String, ctx: StreamCtx, schema_tx: one
 }
 
 async fn cancelled(ctx: &StreamCtx) -> CoreError {
-    if let Err(e) = kill_query(&ctx.opts, ctx.session_id).await {
-        tracing::warn!("mysql: KILL QUERY {} failed: {e}", ctx.session_id);
+    if let Err(e) = kill_with(&ctx.opts, &ctx.caps, ctx.session_id).await {
+        tracing::warn!("mysql: {} failed: {e}", kill_sql(&ctx.caps, ctx.session_id));
     }
     CoreError::Cancelled
 }
@@ -1214,21 +1260,22 @@ async fn deliver(ctx: &StreamCtx, tx: &mpsc::Sender<Result<Batch>>, batch: Batch
 /// "error near ..." message.
 fn prepare_error(e: mysql_async::Error, sql: &str) -> CoreError {
     let err = map_err(e);
-    if server_code(&err) == Some(ER_PARSE_ERROR) && may_have_statement_separator(sql) {
+    if server_error_code(&err) == Some(ER_PARSE_ERROR) && may_have_statement_separator(sql) {
         return CoreError::Invalid(format!("the extraction SQL must be a single SELECT statement; MySQL refused to prepare it: {err}"));
     }
     err
 }
 
-/// Prepare `sql` and stream its result, then close the statement so none is left behind on the
-/// server (`stmt_cache_size` is 0, so mysql_async never closes it on its own).
+/// Prepare `sql` (already encoded for the connection) and stream its result, then close the
+/// statement so none is left behind on the server (`stmt_cache_size` is 0, so mysql_async never
+/// closes it on its own).
 ///
 /// Prepared statements are the multi-statement guard: `COM_STMT_PREPARE` accepts exactly one
 /// statement, whereas the text protocol runs every `;`-separated statement because mysql_async
 /// always negotiates `CLIENT_MULTI_STATEMENTS`.
 async fn run_query(
     conn: &mut Conn,
-    sql: &str,
+    sql: &[u8],
     ctx: &StreamCtx,
     schema_tx: &mut Option<oneshot::Sender<Result<SchemaRef>>>,
     batch_tx: &mpsc::Sender<Result<Batch>>,
@@ -1244,7 +1291,12 @@ async fn run_query(
                 *clean = false;
                 return Err(cancelled(ctx).await);
             }
-            r = &mut fut => r.map_err(|e| prepare_error(e, sql))?,
+            // The caller gave up on `stream()` (its future was dropped): stop like a cancel.
+            _ = batch_tx.closed() => {
+                *clean = false;
+                return Err(cancelled(ctx).await);
+            }
+            r = &mut fut => r.map_err(|e| prepare_error(e, &ctx.sql_text))?,
         }
     };
     let outcome = stream_prepared(conn, &stmt, ctx, schema_tx, batch_tx, clean).await;
@@ -1260,6 +1312,8 @@ async fn run_query(
 }
 
 /// Execute the prepared extraction statement and stream its single result set into batches.
+/// On a pass-through connection text columns in EUC-KR / latin1 are decoded per column; bytes
+/// invalid in their charset become U+FFFD and are counted (logged once, as a count only).
 async fn stream_prepared(
     conn: &mut Conn,
     stmt: &mysql_async::Statement,
@@ -1278,6 +1332,11 @@ async fn stream_prepared(
                 *clean = false;
                 return Err(cancelled(ctx).await);
             }
+            // A slow first row (server-side sort) while the consumer went away.
+            _ = batch_tx.closed() => {
+                *clean = false;
+                return Err(cancelled(ctx).await);
+            }
             r = &mut fut => r.map_err(map_err)?,
         }
     };
@@ -1286,18 +1345,21 @@ async fn stream_prepared(
     let mut named: Vec<(String, ColKind)> = Vec::with_capacity(columns.len());
     let mut kinds: Vec<ColKind> = Vec::with_capacity(columns.len());
     let mut parsers: Vec<ValueParser> = Vec::with_capacity(columns.len());
+    let mut transcode: Vec<Option<Charset>> = Vec::with_capacity(columns.len());
     for c in columns.iter() {
         let (kind, parser) = column_kind(c);
-        named.push((c.name_str().into_owned(), kind));
+        named.push((ctx.text.column_name(c), kind));
         kinds.push(kind);
         parsers.push(parser);
+        transcode.push(ctx.text.transcode(c, parser));
     }
     let schema = schema_from(&named);
     if let Some(tx) = schema_tx.take() {
         let _ = tx.send(Ok(schema.clone()));
     }
-    let mut batcher = ArrowBatcher::with_limits(schema, kinds, ctx.max_rows, BATCH_BYTES);
+    let mut batcher = ArrowBatcher::with_limits(schema, kinds, ctx.max_rows, ctx.max_bytes);
     let mut scratch = String::new();
+    let mut replaced: u64 = 0;
 
     *clean = false;
     {
@@ -1313,6 +1375,9 @@ async fn stream_prepared(
             let step = tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => Step::Cancel,
+                // The pipeline dropped the stream (sink failure, job torn down) while the server
+                // is slow to produce the next row: do not wait for it, kill the query now.
+                _ = batch_tx.closed() => Step::Cancel,
                 n = rows.next() => match n {
                     Some(Ok(r)) => Step::Row(r),
                     Some(Err(e)) => Step::Fail(e),
@@ -1325,7 +1390,18 @@ async fn stream_prepared(
                 Step::End => break,
                 Step::Row(row) => {
                     for (i, p) in parsers.iter().enumerate() {
-                        let cell = p.cell(row.as_ref(i), &mut scratch, i)?;
+                        let v = row.as_ref(i);
+                        let cell = match (transcode[i], v) {
+                            (Some(cs), Some(Value::Bytes(b))) => {
+                                let d = decode_cell(cs, b, &mut scratch);
+                                replaced += u64::from(d.replaced);
+                                if d.replaced {
+                                    ctx.replaced.fetch_add(d.text.matches('\u{FFFD}').count() as u64, Ordering::Relaxed);
+                                }
+                                Cell::Str(d.text)
+                            }
+                            _ => p.cell(v, &mut scratch, i)?,
+                        };
                         batcher.push(cell)?;
                     }
                     if batcher.end_row()? {
@@ -1336,6 +1412,9 @@ async fn stream_prepared(
                 }
             }
         }
+    }
+    if replaced > 0 {
+        tracing::warn!("mysql: {replaced} text values held bytes that are invalid in their character set; they were decoded with U+FFFD");
     }
     if let Some(b) = batcher.flush()? {
         deliver(ctx, batch_tx, Batch::Arrow(b)).await?;
@@ -1350,91 +1429,44 @@ async fn stream_prepared(
 #[async_trait]
 impl Source for MySqlDatabase {
     async fn probe(&self) -> Result<ServerInfo> {
-        let head = self.query_first("SELECT VERSION(), CURRENT_USER(), DATABASE()").await?;
-        let (version_raw, user, database) = match head {
-            Some(r) => (row_str(&r, 0).unwrap_or_default(), row_str(&r, 1), row_str(&r, 2)),
-            None => (self.version.raw.clone(), None, None),
-        };
-        let version = ServerVersion::parse(&version_raw);
-
-        let vars_sql = "SHOW VARIABLES WHERE Variable_name IN ('innodb_buffer_pool_size','max_execution_time','max_statement_time',\
-             'net_read_timeout','net_write_timeout','max_allowed_packet','wait_timeout','version_comment','sql_mode',\
-             'character_set_server','read_only','transaction_isolation','tx_isolation','innodb_page_size')";
-        let mut settings = BTreeMap::new();
-        for (k, v) in self.query_map(vars_sql, |r: Row| (row_str(&r, 0).unwrap_or_default(), row_str(&r, 1).unwrap_or_default())).await? {
-            settings.insert(k, v);
-        }
-
-        let pool = settings.get("innodb_buffer_pool_size").and_then(|v| v.parse::<u64>().ok());
-        let ram_bytes = pool.map(|p| p / 3 * 4 + (p % 3) * 4 / 3);
-        let ram_source = pool.map(|_| "innodb_buffer_pool_size x 1.33".to_string());
-
-        let mut notes = Vec::new();
-        let can_write = match self.query_map("SHOW GRANTS", |r: Row| row_str(&r, 0).unwrap_or_default()).await {
-            Ok(lines) => Some(grants_allow_write(&lines)),
-            Err(e) => {
-                notes.push(format!("SHOW GRANTS failed: {e}"));
-                None
-            }
-        };
-        notes.push(format!("{} {}.{}.{}", version.label(), version.major, version.minor, version.patch));
-        if ram_bytes.is_none() {
-            notes.push("innodb_buffer_pool_size not visible; server RAM unknown".into());
-        }
-
-        Ok(ServerInfo {
-            driver: "mysql".into(),
-            version: version_raw,
-            user: user.or_else(|| self.user.clone()),
-            database: database.or_else(|| self.database.clone()),
-            ram_bytes,
-            ram_source,
-            settings,
-            can_write,
-            notes,
-        })
+        mysql_common::probe(self).await
     }
 
     async fn apply_session(&self, opts: &SessionOpts) -> Result<()> {
-        // Every later transaction of this (extraction) session is read only, so even a
-        // statement that slipped past sqlguard cannot change data. MySQL 5.6.5+ / MariaDB 10.0+
-        // know the syntax; an older server answers with a parse error and keeps going without
-        // it (the prepared-statement guard in `stream` still applies).
-        match self.query_drop("SET SESSION TRANSACTION READ ONLY").await {
-            Ok(()) => {}
-            Err(e) if server_code(&e) == Some(ER_PARSE_ERROR) => {
-                tracing::warn!("mysql {}: SET SESSION TRANSACTION READ ONLY is not supported; the extraction session stays read-write", self.version.raw)
-            }
-            Err(e) => return Err(e),
-        }
-        let mut stmts: Vec<String> = Vec::new();
-        if let Some(ms) = opts.statement_timeout_ms {
-            match self.version.flavor {
-                Flavor::MariaDb => stmts.push(format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)),
-                Flavor::MySql if self.version.supports_max_execution_time() => stmts.push(format!("SET SESSION max_execution_time = {ms}")),
-                Flavor::MySql => tracing::debug!("mysql {}: max_execution_time unsupported; statement timeout ignored", self.version.raw),
-            }
-        }
-        let net = std::cmp::max(600, opts.statement_timeout_ms.unwrap_or(0) / 1000);
-        stmts.push(format!("SET SESSION net_read_timeout = {net}"));
-        stmts.push(format!("SET SESSION net_write_timeout = {net}"));
-        for s in stmts {
-            match self.query_drop(&s).await {
-                Ok(()) => {}
-                // Unknown system variable (older server / fork) -> unsupported, ignore.
-                Err(e) if server_code(&e) == Some(ER_UNKNOWN_SYSTEM_VARIABLE) => tracing::debug!("mysql: ignoring unsupported session option: {s}"),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        mysql_common::apply_session(self, opts).await
     }
 
     async fn stream(&self, q: &Query, opts: &SessionOpts, cancel: CancellationToken) -> Result<SourceStream> {
         // `Batch::RawCsv` is PostgreSQL only; every output comes out of this driver as Arrow.
-        let conn = self.conn.lock().await.take().ok_or_else(|| CoreError::Connect("connection is busy with a running extraction".into()))?;
-        let sql = tag_sql(&self.application_name, &q.sql);
+        // Checked before tagging, so an unrepresentable character is reported at its line /
+        // column in the user's SQL rather than in `/* tag */ SQL`.
+        self.facts.check_sql_text(&q.sql)?;
+        let tagged = tag_sql(&self.facts.application_name, &q.sql);
+        let sql = self.facts.encode_sql(&tagged)?.into_owned();
+        let conn = {
+            let mut guard = self.idle_conn().await?;
+            match std::mem::replace(&mut *guard, Slot::Busy) {
+                Slot::Idle(c) => c,
+                other => {
+                    *guard = other;
+                    return Err(CoreError::Connect(BUSY.into()));
+                }
+            }
+        };
         let max_rows = opts.fetch_batch_rows.map(|n| (n as usize).clamp(1, BATCH_ROWS)).unwrap_or(BATCH_ROWS);
-        let ctx = StreamCtx { opts: self.opts.clone(), session_id: self.session_id, slot: self.conn.clone(), cancel, max_rows };
+        let replaced = Arc::new(AtomicU64::new(0));
+        let ctx = StreamCtx {
+            opts: self.opts.clone(),
+            caps: self.facts.caps,
+            session_id: self.session_id.load(Ordering::Relaxed),
+            slot: self.conn.clone(),
+            cancel,
+            max_rows,
+            max_bytes: q.batch_bytes(),
+            replaced: replaced.clone(),
+            text: TextDecode { plan: self.facts.plan.clone(), collations: self.facts.collations.clone() },
+            sql_text: q.sql.clone(),
+        };
         let (schema_tx, schema_rx) = oneshot::channel();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<Batch>>(READER_CHANNEL_DEPTH);
         tokio::spawn(stream_task(conn, sql, ctx, schema_tx, batch_tx));
@@ -1443,67 +1475,105 @@ impl Source for MySqlDatabase {
             Err(_) => return Err(CoreError::Internal("mysql reader task ended before reporting the result schema".into())),
         };
         let stream = futures::stream::unfold(batch_rx, |mut rx| async move { rx.recv().await.map(|b| (b, rx)) });
-        Ok(SourceStream { schema: Some(schema), stream: Box::pin(stream) })
+        // Only a non-UTF-8 text plan decodes anything (and can produce U+FFFD).
+        let replaced = (!matches!(self.facts.plan, TextPlan::ServerUtf8 { .. })).then_some(replaced);
+        Ok(SourceStream { schema: Some(schema), stream: Box::pin(stream), replaced })
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<Option<PlanSummary>> {
-        let started = Instant::now();
-        let body = trim_statement(sql);
-        // EXPLAIN goes over the text protocol, where mysql_async's always-on multi-statement
-        // support would run anything after a `;` for real (and EXPLAIN ANALYZE executes the
-        // query itself). Refuse such text before it reaches the server.
-        self.ensure_single_statement(body).await?;
-        if analyze {
-            if !self.version.supports_explain_analyze() {
-                return Err(CoreError::Invalid(format!("EXPLAIN ANALYZE needs MySQL 8.0.18 or newer (server is {})", self.version.raw)));
-            }
-            return match self.version.flavor {
-                Flavor::MySql => {
-                    let lines = self.query_map(&format!("EXPLAIN ANALYZE {body}"), |r: Row| explain_row_text(&r)).await?;
-                    let raw = lines.join("\n");
-                    let estimated_rows = explain_analyze_root_rows(&raw);
-                    Ok(Some(PlanSummary {
-                        estimated_rows,
-                        estimated_width: None,
-                        total_cost: None,
-                        estimated_bytes: None,
-                        analyzed: true,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                        warnings: vec![],
-                        tables: vec![],
-                        root: None,
-                        raw,
-                        raw_format: "text".into(),
-                    }))
-                }
-                Flavor::MariaDb => {
-                    let lines = self.query_map(&format!("ANALYZE FORMAT=JSON {body}"), |r: Row| explain_row_text(&r)).await?;
-                    let raw = lines.join("\n");
-                    let parsed = parse_explain_json(&raw)?;
-                    Ok(Some(parsed.into_summary(raw, true, started.elapsed().as_millis() as u64)))
-                }
-            };
-        }
-        let lines = self.explain_with_short_timeouts(&format!("EXPLAIN FORMAT=JSON {body}")).await?;
-        let raw = lines.join("\n");
-        let parsed = parse_explain_json(&raw)?;
-        Ok(Some(parsed.into_summary(raw, false, started.elapsed().as_millis() as u64)))
+        mysql_common::explain(self, sql, analyze).await
     }
 
     fn session_id(&self) -> Option<String> {
-        Some(self.session_id.to_string())
+        Some(self.session_id.load(Ordering::Relaxed).to_string())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn driver_id(&self) -> &'static str {
         "mysql"
     }
+
+    fn sql_charset(&self) -> Option<Charset> {
+        Some(self.facts.plan.sql_charset()).filter(|cs| !cs.is_utf8_like())
+    }
 }
 
 impl Database for MySqlDatabase {}
 
-/// The one text column of an EXPLAIN row (`EXPLAIN` / `Create Table` style outputs).
-fn explain_row_text(row: &Row) -> String {
-    row_str(row, 0).unwrap_or_default()
+/// The shared-logic surface (design doc section 4) over the text protocol: SQL encoded by
+/// `facts.encode_sql` and sent as bytes, rows read as raw bytes with the column collation ids.
+#[async_trait]
+impl MysqlRawQuery for MySqlDatabase {
+    fn facts(&self) -> &ServerFacts {
+        &self.facts
+    }
+
+    async fn meta_query(&self, sql: &str) -> Result<MetaRows> {
+        let bytes = self.facts.encode_sql(sql)?;
+        let mut guard = self.idle_conn().await?;
+        let out = query_meta(conn_mut(&mut guard)?, &bytes).await;
+        if matches!(out, Err(CoreError::Connect(_))) {
+            *guard = Slot::Gone;
+        }
+        out
+    }
+
+    async fn meta_exec(&self, sql: &str) -> Result<()> {
+        let bytes = self.facts.encode_sql(sql)?;
+        let mut guard = self.idle_conn().await?;
+        let out = conn_mut(&mut guard)?.query_drop(bytes.as_ref()).await.map_err(map_err);
+        if matches!(out, Err(CoreError::Connect(_))) {
+            *guard = Slot::Gone;
+        }
+        out
+    }
+
+    async fn meta_query_cancellable(&self, sql: &str, cancel: CancellationToken) -> Result<MetaRows> {
+        let bytes = self.facts.encode_sql(sql)?.into_owned();
+        let mut guard = self.idle_conn().await?;
+        let id = self.session_id.load(Ordering::Relaxed);
+        let (out, lost) = {
+            let conn = conn_mut(&mut guard)?;
+            let fut = query_meta(conn, &bytes);
+            tokio::pin!(fut);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    if let Err(e) = self.kill_from_side(id).await {
+                        tracing::warn!("mysql: {} failed: {e}", kill_sql(&self.facts.caps, id));
+                    }
+                    if self.facts.caps.kill_query {
+                        // KILL QUERY interrupts the statement: read its error so the connection
+                        // stays clean and usable.
+                        let settled = tokio::time::timeout(KILL_TIMEOUT, &mut fut).await.is_ok();
+                        (Err(CoreError::Cancelled), !settled)
+                    } else {
+                        // 4.1: KILL ended the whole session; the next call reconnects.
+                        (Err(CoreError::Cancelled), true)
+                    }
+                }
+                r = &mut fut => {
+                    let lost = matches!(r, Err(CoreError::Connect(_)));
+                    (r, lost)
+                }
+            }
+        };
+        if lost {
+            *guard = Slot::Gone;
+        }
+        out
+    }
+
+    async fn kill_from_side(&self, target: u32) -> Result<()> {
+        kill_with(&self.opts, &self.facts.caps, target).await
+    }
+
+    fn write_samples(&self) -> &WriteSamples {
+        &self.write_samples
+    }
 }
 
 /// `SHOW GRANTS` lines -> can this account modify data or schema anywhere?
@@ -1525,7 +1595,7 @@ pub fn grants_allow_write(lines: &[String]) -> bool {
 }
 
 /// Top-line actual row count of `EXPLAIN ANALYZE` text (`... (actual time=.. rows=N loops=1)`).
-fn explain_analyze_root_rows(raw: &str) -> Option<u64> {
+pub(crate) fn explain_analyze_root_rows(raw: &str) -> Option<u64> {
     let first = raw.lines().next()?;
     let actual = first.find("actual time=")?;
     let tail = &first[actual..];
@@ -1545,24 +1615,6 @@ pub struct ExplainParsed {
     pub estimated_rows: Option<u64>,
     pub total_cost: Option<f64>,
     pub tables: Vec<TableRef>,
-}
-
-impl ExplainParsed {
-    fn into_summary(self, raw: String, analyzed: bool, elapsed_ms: u64) -> PlanSummary {
-        PlanSummary {
-            estimated_rows: self.estimated_rows,
-            estimated_width: None,
-            total_cost: self.total_cost,
-            estimated_bytes: None,
-            analyzed,
-            elapsed_ms,
-            warnings: vec![],
-            tables: self.tables,
-            root: self.root,
-            raw,
-            raw_format: "json".into(),
-        }
-    }
 }
 
 /// Parse MySQL (and MariaDB) `EXPLAIN FORMAT=JSON` output into a [`PlanNode`] tree.
@@ -1952,7 +2004,11 @@ mod tests {
         assert!(ValueParser::Int.cell(Some(&Value::Bytes(b"x".to_vec())), &mut scratch, 0).is_err());
         assert!(matches!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![0x01, 0x02])), &mut scratch, 0).unwrap(), Cell::I64(258)));
         assert!(matches!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![])), &mut scratch, 0).unwrap(), Cell::I64(0)));
-        assert!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![0xff; 8])), &mut scratch, 0).is_err());
+        // BIT(64) with the top bit set: the bits survive (consumers reinterpret them as u64).
+        assert!(matches!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![0xff; 8])), &mut scratch, 0).unwrap(), Cell::I64(-1)));
+        assert!(matches!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![0x80, 0, 0, 0, 0, 0, 0, 0])), &mut scratch, 0).unwrap(), Cell::I64(i64::MIN)));
+        assert!(matches!(ValueParser::Bit.cell(Some(&Value::UInt(u64::MAX)), &mut scratch, 0).unwrap(), Cell::I64(-1)));
+        assert!(ValueParser::Bit.cell(Some(&Value::Bytes(vec![0xff; 9])), &mut scratch, 0).is_err());
         match ValueParser::Float.cell(Some(&Value::Bytes(b"1.5e3".to_vec())), &mut scratch, 0).unwrap() {
             Cell::F64(f) => assert_eq!(f, 1500.0),
             other => panic!("unexpected {other:?}"),
@@ -2093,6 +2149,12 @@ mod tests {
         assert!(matches!(map_err(server(2002)), CoreError::Connect(_)));
         assert!(matches!(map_err(server(2003)), CoreError::Connect(_)));
         assert!(matches!(map_err(server(2013)), CoreError::Connect(_)));
+        // 5.6.5+ with secure_auth refusing an old hash; greeting-time host errors (no SQLSTATE).
+        assert!(matches!(map_err(server(1275)), CoreError::Auth(m) if m.contains(mysql_common::SECURE_AUTH_HINT)));
+        let greeting_err = |code: u16| mysql_async::Error::Server(ServerError { code, message: format!("Host 'x' error {code}"), state: String::new() });
+        assert!(matches!(map_err(greeting_err(1129)), CoreError::Connect(m) if m.contains("FLUSH HOSTS") && m.contains("mysqladmin flush-hosts")));
+        assert!(matches!(map_err(greeting_err(1130)), CoreError::Connect(m) if m.contains(mysql_common::HOST_NOT_ALLOWED_HINT)));
+        assert!(matches!(map_err(greeting_err(1105)), CoreError::Query { msg, .. } if !msg.contains("SQLSTATE")));
         match map_err(server(1064)) {
             CoreError::Query { code, msg } => {
                 assert_eq!(code.as_deref(), Some("1064"));
@@ -2106,7 +2168,7 @@ mod tests {
         assert!(matches!(map_err(closed), CoreError::Connect(_)));
         let unbound = mysql_async::Error::Driver(mysql_async::DriverError::StmtParamsMismatch { required: 1, supplied: 0 });
         assert!(matches!(map_err(unbound), CoreError::Invalid(_)));
-        assert_eq!(server_code(&map_err(server(1193))), Some(1193));
+        assert_eq!(server_error_code(&map_err(server(1193))), Some(1193));
         assert!(is_tls_error(&mysql_async::Error::Driver(mysql_async::DriverError::NoClientSslFlagFromServer)));
         assert!(!is_tls_error(&server(1045)));
     }
@@ -2270,29 +2332,83 @@ mod tests {
         assert!(parse_explain_json("[1,2]").is_err());
     }
 
+    /// Pass-through connections decode text columns by their own collation; everything else is
+    /// left to the server (UTF-8) or is binary.
+    #[test]
+    fn pass_through_columns_are_transcoded_by_collation() {
+        let pass = TextDecode { plan: TextPlan::PassThrough { client: "latin1", legacy: Charset::EucKr }, collations: CollationMap::builtin() };
+        let text = |charset: u16| col(ColumnType::MYSQL_TYPE_VAR_STRING).with_character_set(charset);
+        assert_eq!(pass.transcode(&text(8), ValueParser::Text), Some(Charset::EucKr), "CP949 stored in a latin1 column");
+        assert_eq!(pass.transcode(&text(19), ValueParser::Text), Some(Charset::EucKr));
+        assert_eq!(pass.transcode(&text(33), ValueParser::Text), None, "utf8 columns are UTF-8 already");
+        assert_eq!(pass.transcode(&text(63), ValueParser::Text), None, "binary is never transcoded");
+        assert_eq!(pass.transcode(&text(8), ValueParser::Int), None, "only text parsers");
+        let blob = col(ColumnType::MYSQL_TYPE_BLOB).with_character_set(63);
+        assert_eq!(column_kind(&blob).0, ColKind::Binary);
+        // The data dictionary holds a latin1 client's Korean as windows-1252 characters.
+        let named = col(ColumnType::MYSQL_TYPE_VAR_STRING).with_name("ÇÑ±Û".as_bytes());
+        assert_eq!(pass.column_name(&named), "한글");
+
+        let utf8 = TextDecode { plan: TextPlan::ServerUtf8 { names: "utf8mb4" }, collations: CollationMap::builtin() };
+        assert_eq!(utf8.transcode(&text(45), ValueParser::Text), None);
+        assert_eq!(utf8.column_name(&named), "ÇÑ±Û", "only the latin1 pass-through plan repairs names");
+        let euckr_client = TextDecode { plan: TextPlan::PassThrough { client: "euckr", legacy: Charset::EucKr }, collations: CollationMap::builtin() };
+        assert_eq!(euckr_client.column_name(&named), "ÇÑ±Û");
+    }
+
+    #[test]
+    fn old_password_refusal_names_the_toggle() {
+        match map_err(mysql_async::Error::Driver(mysql_async::DriverError::MysqlOldPasswordDisabled)) {
+            CoreError::Auth(msg) => assert!(msg.contains("allow_old_password"), "{msg}"),
+            other => panic!("expected AUTH, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opts_follow_the_old_password_toggle() {
+        let params = ConnectParams {
+            driver: "mysql".into(),
+            host: "db.test".into(),
+            port: 3306,
+            database: Some("shop".into()),
+            user: Some("app".into()),
+            password: Some("secret".into()),
+            fields: Default::default(),
+            application_name: "bulkdb-test".into(),
+            connect_timeout: Duration::from_secs(5),
+            ssl: SslMode::Disable,
+        };
+        assert!(build_opts(&params, None, false).secure_auth());
+        let old = build_opts(&params, None, true);
+        assert!(!old.secure_auth());
+        // Set in Opts so mysql_async skips its post-connect SELECT of both variables.
+        assert_eq!(old.max_allowed_packet(), Some(CLIENT_MAX_ALLOWED_PACKET));
+        assert_eq!(old.wait_timeout(), Some(CLIENT_WAIT_TIMEOUT_S));
+
+        // No TLS backend: require / verify-full are refused before any socket, prefer is fine.
+        for (ssl, ok) in [(SslMode::Disable, true), (SslMode::Prefer, true), (SslMode::Require, TLS_BACKEND), (SslMode::VerifyFull, TLS_BACKEND)] {
+            let r = check_tls_supported(&ConnectParams { ssl, ..params.clone() });
+            assert_eq!(r.is_ok(), ok, "{ssl:?}: {r:?}");
+            assert!(r.is_ok() || matches!(&r, Err(CoreError::Connect(m)) if m.contains("sslmode")), "{r:?}");
+        }
+    }
+
     #[test]
     fn write_sample_ring() {
-        let db_samples: std::sync::Mutex<HashMap<String, VecDeque<bool>>> = std::sync::Mutex::new(HashMap::new());
-        // Same arithmetic as `record_write_sample`, exercised without a connection.
-        let mut map = db_samples.lock().unwrap();
-        let ring = map.entry("j".into()).or_default();
+        // `record_write_sample` delegates to `WriteSamples`, exercised without a connection.
+        let samples = WriteSamples::default();
+        let mut last = 0.0;
         for i in 0..15 {
-            ring.push_back(i % 3 == 0);
-            while ring.len() > WRITE_RING {
-                ring.pop_front();
-            }
+            last = samples.record("j", i % 3 == 0);
         }
-        assert_eq!(ring.len(), WRITE_RING);
+        // Last ten samples: i = 5..=14 -> writing at 6, 9, 12 -> 3 / 10.
+        assert!((last - 0.3).abs() < 1e-6);
+        samples.forget("j");
+        assert_eq!(samples.record("j", true), 1.0);
     }
 
     #[test]
     fn value_helpers() {
-        assert_eq!(value_u64(Some(&Value::Bytes(b"123".to_vec()))), Some(123));
-        assert_eq!(value_u64(Some(&Value::Bytes(b"123.0".to_vec()))), Some(123));
-        assert_eq!(value_u64(Some(&Value::Int(-1))), None);
-        assert_eq!(value_u64(Some(&Value::UInt(7))), Some(7));
-        assert_eq!(value_u64(Some(&Value::NULL)), None);
-        assert_eq!(value_u64(None), None);
         assert_eq!(value_str(Some(&Value::Date(2024, 5, 6, 0, 0, 0, 0))).as_deref(), Some("2024-05-06"));
         assert_eq!(value_str(Some(&Value::Date(2024, 5, 6, 7, 8, 9, 10))).as_deref(), Some("2024-05-06 07:08:09.000010"));
         assert_eq!(value_str(Some(&Value::Bytes(vec![0xff, b'a']))).as_deref(), Some("\u{fffd}a"));

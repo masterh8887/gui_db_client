@@ -1,5 +1,7 @@
 // Host platform helpers for the WebView. The only place in the UI that looks at the OS.
 
+import { useSyncExternalStore } from 'react';
+
 interface NavigatorUAData {
   platform?: string;
 }
@@ -40,4 +42,25 @@ export function hasModKey(e: { metaKey: boolean; ctrlKey: boolean }): boolean {
 /** `Ctrl+Enter` / `⌘+Enter` style label. */
 export function shortcutLabel(key: string, mod = true): string {
   return mod ? `${modKeySymbol()}+${key}` : key;
+}
+
+/** `data-platform` value for `<html>`: `mac`, else `windows` (the only two targets). */
+export function platformKey(): 'mac' | 'windows' {
+  return isMac() ? 'mac' : 'windows';
+}
+
+/** Set `<html data-platform>` (AppShell, once). Windows overrides in globals.css key off it. */
+export function applyPlatform(): void {
+  if (typeof document === 'undefined') return;
+  document.documentElement.dataset.platform = platformKey();
+}
+
+const noSubscribe = () => () => {};
+
+/**
+ * `isMac()` for render code. The static export prerenders without a navigator (false); the
+ * client snapshot takes over after hydration, so the first client render matches the HTML.
+ */
+export function useIsMac(): boolean {
+  return useSyncExternalStore(noSubscribe, isMac, () => false);
 }

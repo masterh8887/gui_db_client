@@ -22,12 +22,12 @@ export function Checkbox({ checked, onChange, disabled, id, className, ...aria }
       disabled={disabled}
       aria-label={aria['aria-label']}
       className={cn(
-        'inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border border-border bg-background data-[state=checked]:border-accent data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-not-allowed disabled:opacity-50',
+        'inline-flex h-[14px] w-[14px] shrink-0 items-center justify-center rounded-[4px] bg-btn text-on-accent shadow-btn data-[state=checked]:bg-accent-fill data-[state=checked]:shadow-none focus-visible:outline-2 focus-visible:outline-focus disabled:pointer-events-none disabled:opacity-45',
         className,
       )}
     >
       <RadixCheckbox.Indicator>
-        <Check size={12} strokeWidth={3} />
+        <Check size={10} strokeWidth={3} />
       </RadixCheckbox.Indicator>
     </RadixCheckbox.Root>
   );

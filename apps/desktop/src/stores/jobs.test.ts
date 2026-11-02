@@ -1,7 +1,16 @@
 import type { JobDone, JobProgress, JobServer, JobState, JobSummary } from 'ipc-types';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { resetStores } from '@/test/stores';
-import { ALL_STATES, mergeSnapshot, selectActiveJobs, selectLastResult, selectRecentResults, useJobsStore } from './jobs';
+import {
+  ALL_STATES,
+  mergeSnapshot,
+  selectActiveJobs,
+  selectJobsForConn,
+  selectLastResult,
+  selectPrimaryActiveJob,
+  selectRecentResults,
+  useJobsStore,
+} from './jobs';
 
 const at = '2026-10-26T10:00:00.000Z';
 
@@ -182,5 +191,33 @@ describe('jobs store', () => {
     s.upsertSummary(summary('b', 'done'));
     s.clearFinished();
     expect(useJobsStore.getState().order).toEqual(['a']);
+  });
+});
+
+describe('jobs selectors for the toolbar and the pill', () => {
+  beforeEach(() => resetStores());
+
+  it('selectJobsForConn keeps the jobs of one connection in first-seen order', () => {
+    const s = useJobsStore.getState();
+    s.upsertSummary({ ...summary('a', 'running'), connId: 'c1' });
+    s.upsertSummary({ ...summary('b', 'running'), connId: 'c2' });
+    s.upsertSummary({ ...summary('c', 'done'), connId: 'c1' });
+    expect(selectJobsForConn(useJobsStore.getState(), 'c1').map((e) => e.summary.id)).toEqual(['a', 'c']);
+    expect(selectJobsForConn(useJobsStore.getState(), null)).toEqual([]);
+  });
+
+  it('selectPrimaryActiveJob: warned > running > finishing > preflight > pending, newest among equals', () => {
+    const s = useJobsStore.getState();
+    expect(selectPrimaryActiveJob(useJobsStore.getState())).toBeUndefined();
+    s.upsertSummary({ ...summary('p', 'pending'), connId: 'c1' });
+    s.upsertSummary({ ...summary('f', 'finishing'), connId: 'c1' });
+    expect(selectPrimaryActiveJob(useJobsStore.getState())?.summary.id).toBe('f');
+    s.upsertSummary({ ...summary('r1', 'running'), connId: 'c1' });
+    s.upsertSummary({ ...summary('r2', 'running'), connId: 'c2' });
+    expect(selectPrimaryActiveJob(useJobsStore.getState())?.summary.id).toBe('r2');
+    expect(selectPrimaryActiveJob(useJobsStore.getState(), 'c1')?.summary.id).toBe('r1');
+    s.upsertSummary({ ...summary('w', 'warned'), connId: 'c1' });
+    s.upsertSummary({ ...summary('d', 'done'), connId: 'c1' });
+    expect(selectPrimaryActiveJob(useJobsStore.getState())?.summary.id).toBe('w');
   });
 });

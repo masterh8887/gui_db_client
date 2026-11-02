@@ -15,15 +15,19 @@
 //! bulk-cli history --conn prod --limit 20
 //! bulk-cli settings get | set max_concurrent_jobs=2 default_output_dir=/data/exports
 //! bulk-cli diagnostics --out ./support
+//! bulk-cli copy    plan | run | resume | runs | status | forget
 //! ```
 //!
 //! `--progress` prints rows, MB/s, ETA and the process RSS once per second (the memory gate).
 //! Everything goes through [`bulk_core::BulkDb`]; this crate only parses flags, prints and
-//! maps job states to exit codes (0 done, 1 failed, 2 cancelled, 3 rejected, 4 needs --yes).
+//! maps job states to exit codes (0 done, 1 failed, 2 cancelled, 3 rejected, 4 needs --yes,
+//! 5 copy failed or ended with problems).
 
 mod args;
+mod args_copy;
 mod cmd_catalog;
 mod cmd_conn;
+mod cmd_copy;
 mod cmd_export;
 mod cmd_history;
 mod cmd_info;
@@ -122,8 +126,15 @@ where
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let json = cli.json;
-    let db: Arc<BulkDb> =
-        BulkDb::new(BulkDbOptions { config_dir: cli.config_dir.clone(), prompts: Some(Arc::new(prompts::StdinPrompts)), credentials: None, init_logging: false }).await?;
+    let db: Arc<BulkDb> = BulkDb::new(BulkDbOptions {
+        config_dir: cli.config_dir.clone(),
+        prompts: Some(Arc::new(prompts::StdinPrompts)),
+        credentials: None,
+        init_logging: false,
+        instance_kind: Some("cli".into()),
+        copy_target_opener: None,
+    })
+    .await?;
     let result = match cli.cmd {
         Cmd::Export(a) => cmd_export::run(&db, a, json).await,
         Cmd::Catalog(a) => with_ctrl_c(cmd_catalog::run(&db, a, json)).await,
@@ -137,6 +148,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::History(a) => cmd_history::run(&db, a, json),
         Cmd::Settings(a) => cmd_settings::run(&db, a, json),
         Cmd::Diagnostics(a) => cmd_info::diagnostics(&db, a, json),
+        Cmd::Copy(a) => cmd_copy::run(&db, a, json).await,
     };
     db.shutdown().await;
     result

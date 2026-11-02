@@ -30,12 +30,35 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U bulkdb" --health-interval 5s --health-timeout 5s --health-retries 20
+      # DB copy targets for crates/core/tests/copy_it.rs (docs/db-copy.md section 9):
+      # postgres:15 (above) -> 16 / 17, and mysql:5.5 euckr (step below) -> mysql:8 / mysql:9.
+      postgres16:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: bulkdb, POSTGRES_USER: bulkdb, POSTGRES_DB: bulkdb }
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bulkdb" --health-interval 5s --health-timeout 5s --health-retries 20
+      postgres17:
+        image: postgres:17
+        env: { POSTGRES_PASSWORD: bulkdb, POSTGRES_USER: bulkdb, POSTGRES_DB: bulkdb }
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bulkdb" --health-interval 5s --health-timeout 5s --health-retries 20
       mysql:
         image: mysql:8
         env: { MYSQL_ROOT_PASSWORD: bulkdb, MYSQL_DATABASE: bulkdb }
         ports: ["3306:3306"]
         options: >-
           --health-cmd "mysqladmin ping -pbulkdb" --health-interval 5s --health-timeout 5s --health-retries 30
+      # MySQL 9.x: mysql_native_password is gone, root authenticates with caching_sha2_password.
+      # The ping goes over TCP so the image's --skip-networking init server never counts as up.
+      mysql9:
+        image: mysql:9
+        env: { MYSQL_ROOT_PASSWORD: bulkdb, MYSQL_DATABASE: bulkdb }
+        ports: ["3308:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 -P3306 -uroot -pbulkdb --silent"
+          --health-interval 5s --health-timeout 5s --health-start-period 20s --health-retries 30
       mssql:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env: { ACCEPT_EULA: "Y", MSSQL_SA_PASSWORD: "BulkDb!Passw0rd" }
@@ -113,10 +136,37 @@ jobs:
           echo "sshd did not answer on 127.0.0.1:2222"
           sudo cat "$SSH_IT_DIR/sshd.log" || true
           exit 1
+      # Legacy MySQL for mysql_it.rs and copy_it.rs (`BULKDB_MYSQL55_URL`): an EUC-KR server that hashes
+      # passwords the pre-4.1 way, like the Korean 4.x / 5.x installations BulkDB must read.
+      # GitHub `services:` cannot pass server arguments, so this step starts the container.
+      # Port 3307, beside the mysql:8 service on 3306. The ping goes over TCP: the image's
+      # first-start initialisation runs a temporary server with --skip-networking.
+      - name: start MySQL 5.5 (euckr, old passwords)
+        shell: bash
+        run: |
+          docker run -d --name mysql55 -p 3307:3306 -e MYSQL_ROOT_PASSWORD=bulkdb -e MYSQL_DATABASE=bulkdb \
+            mysql:5.5 --character-set-server=euckr --collation-server=euckr_korean_ci --old-passwords=1 --secure-auth=0
+          for _ in $(seq 1 60); do
+            if docker exec mysql55 mysqladmin ping -h127.0.0.1 -P3306 -uroot -pbulkdb --silent; then
+              echo "mysql:5.5 is up on 127.0.0.1:3307"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mysql55
+          exit 1
       - name: integration tests against docker databases and the OpenSSH server
         env:
           BULKDB_PG_URL: postgres://bulkdb:bulkdb@127.0.0.1:5432/bulkdb
+          # copy_it.rs targets: postgres:16 / postgres:17 / mysql:9 services above.
+          BULKDB_PG16_URL: postgres://bulkdb:bulkdb@127.0.0.1:5433/bulkdb
+          BULKDB_PG17_URL: postgres://bulkdb:bulkdb@127.0.0.1:5434/bulkdb
           BULKDB_MYSQL_URL: mysql://root:bulkdb@127.0.0.1:3306/bulkdb
+          BULKDB_MYSQL9_URL: mysql://root:bulkdb@127.0.0.1:3308/bulkdb
+          # mysql:5.5 from the step above (euckr server, root with a pre-4.1 password hash).
+          BULKDB_MYSQL55_URL: mysql://root:bulkdb@127.0.0.1:3307/bulkdb
+          # BULKDB_MYSQL40_URL (copy_it.rs, optional real MySQL 4.0 on 3309) is left unset: there
+          # is no public 4.0 image; the test skips itself.
           # mssql_it.rs parses `mssql://user:pass@host:port/db?field=value` (percent-decoded;
           # trust_server_certificate defaults to true for the self-signed container cert).
           BULKDB_MSSQL_URL: "mssql://sa:BulkDb%21Passw0rd@127.0.0.1:1433/master"
@@ -208,9 +258,9 @@ jobs:
         run: pnpm --filter desktop build:web
       - name: clippy (whole workspace incl. the Tauri shell, ODBC and platform/windows.rs)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: tests (ODBC driver manager, ConPTY tunnel, Windows keyring backend)
+      - name: tests (ODBC driver manager, ConPTY tunnel, Windows keyring backend, Tauri shell)
         env: { BULKDB_CREDENTIALS: memory }
-        run: cargo test --no-fail-fast -p bulk-core -p bulk-cli
+        run: cargo test --no-fail-fast -p bulk-core -p bulk-cli -p bulkdb-desktop
       - run: cargo build --release -p bulk-cli
       - name: smoke (SQLite -> CSV 10k rows, byte-compared against the committed reference)
         run: node scripts/smoke.mjs --cli target/release/bulk-cli.exe
@@ -250,9 +300,9 @@ jobs:
         run: pnpm --filter desktop build:web
       - name: clippy (whole workspace incl. the Tauri shell and platform/macos.rs)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: tests (PTY tunnel, macOS keyring backend)
+      - name: tests (PTY tunnel, macOS keyring backend, Tauri shell incl. the menu bar vs keymap.ts)
         env: { BULKDB_CREDENTIALS: memory }
-        run: cargo test --no-fail-fast -p bulk-core -p bulk-cli
+        run: cargo test --no-fail-fast -p bulk-core -p bulk-cli -p bulkdb-desktop
       - run: cargo build --release -p bulk-cli
       - run: node scripts/smoke.mjs --cli target/release/bulk-cli
       # Apple code signing and notarization only; no TAURI_SIGNING_* because the updater is off

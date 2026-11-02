@@ -22,19 +22,22 @@ export interface TableProps<T> {
   stickyHeader?: boolean;
 }
 
-/** Dense metadata table: 28px rows, 13px text. Never used for data rows (there are none). */
+/**
+ * Metadata table: 26px sticky `bg-panel` header (12px secondary) and 26px rows with hairlines,
+ * no zebra, no vertical lines. Never used for data rows (there are none).
+ */
 export function Table<T>({ columns, rows, rowKey, empty, className, onRowClick, rowClassName, stickyHeader = true }: TableProps<T>) {
   const alignClass = (a?: Column<T>['align']) => (a === 'right' ? 'text-right' : a === 'center' ? 'text-center' : 'text-left');
   return (
-    <table className={cn('w-full border-collapse text-[13px]', className)}>
+    <table className={cn('w-full border-collapse text-base', className)}>
       <thead className={cn(stickyHeader && 'sticky top-0 z-10')}>
-        <tr className="h-7 bg-muted text-xs text-muted-foreground">
+        <tr className="h-(--h-row) bg-panel text-sm text-fg-secondary">
           {columns.map((c) => (
             <th
               key={c.id}
               scope="col"
               style={{ width: c.width }}
-              className={cn('whitespace-nowrap border-b border-border px-2 font-medium', alignClass(c.align), c.className)}
+              className={cn('whitespace-nowrap border-b border-separator px-2 font-medium', alignClass(c.align), c.className)}
             >
               {c.header}
             </th>
@@ -44,7 +47,7 @@ export function Table<T>({ columns, rows, rowKey, empty, className, onRowClick, 
       <tbody>
         {rows.length === 0 ? (
           <tr>
-            <td colSpan={columns.length} className="h-7 px-2 text-center text-muted-foreground">
+            <td colSpan={columns.length} className="h-(--h-row) px-2 text-center text-fg-secondary">
               {empty ?? '—'}
             </td>
           </tr>
@@ -53,7 +56,7 @@ export function Table<T>({ columns, rows, rowKey, empty, className, onRowClick, 
             <tr
               key={rowKey(r, i)}
               onClick={onRowClick ? () => onRowClick(r) : undefined}
-              className={cn('h-7 border-b border-border/60 hover:bg-muted/60', onRowClick && 'cursor-pointer', rowClassName?.(r))}
+              className={cn('h-(--h-row) border-b border-separator', onRowClick && 'hover:bg-hover', rowClassName?.(r))}
             >
               {columns.map((c) => (
                 <td key={c.id} className={cn('truncate px-2 align-middle', alignClass(c.align), c.className)}>

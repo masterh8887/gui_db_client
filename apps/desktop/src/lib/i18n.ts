@@ -697,3 +697,60 @@ export function stateLabel(state: string): string {
 export function phaseLabel(phase: string): string {
   return t(`phase.${phase}` as I18nKey);
 }
+
+// ---- per-folder strings (DESIGN.md §7.3) -------------------------------------------------
+//
+// Each feature folder keeps its own table in `<folder>/strings.ts`:
+//
+//   export const ts = defineStrings('sidebar', { en: { title: 'Items' }, ko: { title: '항목' } });
+//   ts('title');                       // '항목' (or 'Items' in English)
+//   ts('count', { n: 3 });             // `{n}` placeholders, like `t()`
+//
+// Keys are typed from the English table; the Korean table must have exactly the same keys.
+// Lookup happens at call time, so a language switch shows up on the next render (the AppShell
+// remounts its subtree with `key={lang}`). Missing Korean text falls back to English, then to
+// the key. Re-registering a namespace replaces it (HMR); uniqueness across folders is checked by
+// a test through `listNamespaces()`, never by a throw.
+
+export type Translator<K extends string> = {
+  (key: K, params?: Record<string, string | number>): string;
+  readonly ns: string;
+  readonly keys: readonly K[];
+};
+
+interface StringTables {
+  en: Readonly<Record<string, string>>;
+  ko: Readonly<Record<string, string>>;
+}
+
+const namespaces = new Map<string, StringTables>();
+const registrations: string[] = [];
+
+function interpolate(s: string, params?: Record<string, string | number>): string {
+  if (!params) return s;
+  let out = s;
+  for (const [k, v] of Object.entries(params)) out = out.split(`{${k}}`).join(String(v));
+  return out;
+}
+
+export function defineStrings<const E extends Record<string, string>>(
+  ns: string,
+  tables: { en: E; ko: { readonly [K in keyof E]: string } },
+): Translator<Extract<keyof E, string>> {
+  type K = Extract<keyof E, string>;
+  namespaces.set(ns, { en: tables.en, ko: tables.ko as Readonly<Record<string, string>> });
+  registrations.push(ns);
+  const keys = Object.keys(tables.en) as K[];
+  const translate = (key: K, params?: Record<string, string | number>): string => {
+    const current = namespaces.get(ns) ?? tables;
+    const table = currentLang === 'ko' ? current.ko : current.en;
+    const s = table[key] ?? current.en[key] ?? key;
+    return interpolate(s, params);
+  };
+  return Object.assign(translate, { ns, keys }) as Translator<K>;
+}
+
+/** Every `defineStrings` registration in order (a name twice = two folders share it; HMR aside). */
+export function listNamespaces(): readonly string[] {
+  return [...registrations];
+}

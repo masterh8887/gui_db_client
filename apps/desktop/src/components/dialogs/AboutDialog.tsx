@@ -1,90 +1,26 @@
 'use client';
 
-// About BulkDB: version, platform and the app's folders (each with "open folder"), a summary of
-// the database drivers (tier, availability), and the diagnostics bundle — logs and masked
-// config zipped into a folder the user picks, for support requests.
+// About BulkDB (DESIGN.md §5.I, parity row 51): version, platform and the app's folders (each
+// with "open folder"), the database drivers (tier, availability) and the diagnostics bundle —
+// logs and masked config zipped into a folder the user picks, for support requests. Opened
+// through `ui.aboutOpen` (palette, Welcome footer, Settings, macOS App menu); no props.
 
 import type { DiagnosticsBundle, DriverInfo, DriverTier } from 'ipc-types';
-import { Copy, Database, FolderOpen, PackageOpen } from 'lucide-react';
-import { useEffect, useState, type ReactNode } from 'react';
+import { Check, Copy, Database, FolderOpen, PackageOpen } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { appInfo, diagnosticsBundle, openPath } from '@/lib/commands';
 import { pickDirectory, revealPath } from '@/lib/dialogs';
 import { formatBytes } from '@/lib/format';
-import { getLang, t } from '@/lib/i18n';
 import { errorText } from '@/lib/ipc-error';
 import { copyText } from '@/lib/utils';
-import { Badge, Button, Dialog, Notice, Spinner, Table, Tooltip, type Column } from '@/components/ui';
+import { Badge, Button, Dialog, Notice, Spinner, Tooltip } from '@/components/ui';
 import { useConnectionsStore } from '@/stores/connections';
 import { useSettingsStore } from '@/stores/settings';
+import { useUiStore } from '@/stores/ui';
+import { ab } from './AboutDialog.strings';
 
 /** `app_info` result. */
 export type AppInfoData = Awaited<ReturnType<typeof appInfo>>;
-
-// Strings that `lib/i18n` does not have (kept local so this dialog owns its text).
-const TEXT = {
-  ko: {
-    title: 'BulkDB 정보',
-    version: '버전',
-    platform: '플랫폼',
-    arch: '아키텍처',
-    configDir: '설정 폴더',
-    logDir: '로그 폴더',
-    openFolder: '폴더 열기',
-    drivers: '드라이버',
-    driver: '드라이버',
-    tier: '계층',
-    status: '상태',
-    available: '사용 가능',
-    missing: '설치 필요',
-    driversSummary: '{total}개 중 {available}개 사용 가능',
-    noDrivers: '드라이버 정보를 불러오지 못했습니다',
-    diagnostics: '진단 번들',
-    createBundle: '진단 번들 만들기',
-    bundleDone: '진단 번들을 만들었습니다',
-    included: '포함: {list}',
-    copyInfo: '정보 복사',
-    copied: '복사했습니다',
-    'tier.builtin': '내장',
-    'tier.vendor-client': '벤더 클라이언트',
-    'tier.odbc': 'ODBC',
-    'tier.plugin': '플러그인',
-  },
-  en: {
-    title: 'About BulkDB',
-    version: 'Version',
-    platform: 'Platform',
-    arch: 'Architecture',
-    configDir: 'Config folder',
-    logDir: 'Log folder',
-    openFolder: 'Open folder',
-    drivers: 'Drivers',
-    driver: 'Driver',
-    tier: 'Tier',
-    status: 'Status',
-    available: 'Available',
-    missing: 'Not installed',
-    driversSummary: '{available} of {total} available',
-    noDrivers: 'Could not load the driver list',
-    diagnostics: 'Diagnostics bundle',
-    createBundle: 'Create diagnostics bundle',
-    bundleDone: 'Diagnostics bundle created',
-    included: 'Includes: {list}',
-    copyInfo: 'Copy info',
-    copied: 'Copied',
-    'tier.builtin': 'Built-in',
-    'tier.vendor-client': 'Vendor client',
-    'tier.odbc': 'ODBC',
-    'tier.plugin': 'Plugin',
-  },
-} as const;
-
-type TextKey = keyof (typeof TEXT)['en'];
-
-function tx(key: TextKey, params?: Record<string, string | number>): string {
-  let s: string = TEXT[getLang()][key] ?? TEXT.en[key];
-  if (params) for (const [k, v] of Object.entries(params)) s = s.split(`{${k}}`).join(String(v));
-  return s;
-}
 
 const PLATFORM_NAMES: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux', browser: 'Browser (mock)' };
 
@@ -93,7 +29,18 @@ export function platformName(platform: string): string {
 }
 
 function tierLabel(tier: DriverTier): string {
-  return tx(`tier.${tier}` as TextKey);
+  switch (tier) {
+    case 'builtin':
+      return ab('tier.builtin');
+    case 'vendor-client':
+      return ab('tier.vendor-client');
+    case 'odbc':
+      return ab('tier.odbc');
+    case 'plugin':
+      return ab('tier.plugin');
+    default:
+      return String(tier);
+  }
 }
 
 /** Plain-text summary for support tickets (no secrets: paths, versions and driver states only). */
@@ -108,21 +55,25 @@ export function aboutText(info: AppInfoData, drivers: readonly DriverInfo[]): st
   return lines.join('\n');
 }
 
-export interface AboutDialogProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
+/** Shorten a long path in the middle, keeping the drive / root and the last segments. */
+export function middleTruncate(path: string, max = 52): string {
+  if (path.length <= max) return path;
+  const keep = max - 1;
+  const head = Math.ceil(keep * 0.4);
+  return `${path.slice(0, head)}…${path.slice(path.length - (keep - head))}`;
 }
 
-export function AboutDialog({ open, onOpenChange }: AboutDialogProps) {
+export function AboutDialog() {
+  const open = useUiStore((s) => s.aboutOpen);
   if (!open) return null;
-  return <AboutContent onClose={() => onOpenChange(false)} />;
+  return <AboutContent onClose={() => useUiStore.getState().setAboutOpen(false)} />;
 }
 
 function InfoRow({ label, children }: { label: string; children: ReactNode }) {
   return (
     <>
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="flex min-w-0 items-center gap-2">{children}</dd>
+      <dt className="flex min-h-(--h-control) items-center justify-end text-right text-fg-secondary">{label}</dt>
+      <dd className="flex min-h-(--h-control) min-w-0 items-center gap-2">{children}</dd>
     </>
   );
 }
@@ -130,11 +81,19 @@ function InfoRow({ label, children }: { label: string; children: ReactNode }) {
 function FolderRow({ label, path, onOpen }: { label: string; path: string; onOpen: (path: string) => void }) {
   return (
     <InfoRow label={label}>
-      <span className="min-w-0 flex-1 truncate font-mono text-xs" title={path}>
-        {path}
-      </span>
-      <Button size="sm" variant="outline" icon={<FolderOpen size={12} />} onClick={() => onOpen(path)} aria-label={`${tx('openFolder')}: ${label}`}>
-        {tx('openFolder')}
+      <Tooltip content={path}>
+        <span data-selectable className="min-w-0 flex-1 truncate">
+          {middleTruncate(path)}
+        </span>
+      </Tooltip>
+      <Button
+        size="sm"
+        variant="secondary"
+        icon={<FolderOpen size={14} strokeWidth={1.75} />}
+        onClick={() => onOpen(path)}
+        aria-label={`${ab('openFolder')}: ${label}`}
+      >
+        {ab('openFolder')}
       </Button>
     </InfoRow>
   );
@@ -142,14 +101,14 @@ function FolderRow({ label, path, onOpen }: { label: string; path: string; onOpe
 
 function AboutContent({ onClose }: { onClose: () => void }) {
   const drivers = useConnectionsStore((s) => s.drivers);
-  const loadDrivers = useConnectionsStore((s) => s.loadDrivers);
   const [info, setInfo] = useState<AppInfoData | null>(null);
   const [infoError, setInfoError] = useState<string | null>(null);
   const [driversError, setDriversError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [bundle, setBundle] = useState<DiagnosticsBundle | null>(null);
   const [bundling, setBundling] = useState(false);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     let live = true;
@@ -159,6 +118,7 @@ function AboutContent({ onClose }: { onClose: () => void }) {
     );
     return () => {
       live = false;
+      clearTimeout(copiedTimer.current);
     };
   }, []);
 
@@ -167,11 +127,14 @@ function AboutContent({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (!needDrivers) return;
     let live = true;
-    loadDrivers().catch((e: unknown) => live && setDriversError(errorText(e)));
+    useConnectionsStore
+      .getState()
+      .loadDrivers()
+      .catch((e: unknown) => live && setDriversError(errorText(e)));
     return () => {
       live = false;
     };
-  }, [needDrivers, loadDrivers]);
+  }, [needDrivers]);
 
   const open = async (path: string) => {
     setError(null);
@@ -206,52 +169,47 @@ function AboutContent({ onClose }: { onClose: () => void }) {
   };
 
   const copyInfo = async () => {
-    if (!info) return;
-    if (await copyText(aboutText(info, drivers))) setNotice(tx('copied'));
+    if (!info || !(await copyText(aboutText(info, drivers)))) return;
+    setCopied(true);
+    clearTimeout(copiedTimer.current);
+    copiedTimer.current = setTimeout(() => setCopied(false), 1200);
   };
 
   const availableCount = drivers.filter((d) => d.available).length;
-  const columns: Column<DriverInfo>[] = [
-    { id: 'name', header: tx('driver'), cell: (d) => <span title={d.id}>{d.name}</span> },
-    { id: 'tier', header: tx('tier'), cell: (d) => <span className="text-muted-foreground">{tierLabel(d.tier)}</span>, width: 120 },
-    {
-      id: 'status',
-      header: tx('status'),
-      width: 110,
-      cell: (d) =>
-        d.available ? (
-          <Badge tone="success">{tx('available')}</Badge>
-        ) : (
-          <Tooltip content={d.detail ?? d.installHint}>
-            <Badge tone="warning">{tx('missing')}</Badge>
-          </Tooltip>
-        ),
-    },
-  ];
 
   return (
     <Dialog
       open
       onOpenChange={(o) => !o && onClose()}
-      title={tx('title')}
-      width="lg"
+      title={ab('title')}
+      width="md"
+      footerStart={
+        <Button
+          variant="ghost"
+          icon={copied ? <Check size={14} strokeWidth={2} className="text-success" /> : <Copy size={14} strokeWidth={1.75} />}
+          onClick={() => void copyInfo()}
+          disabled={!info}
+        >
+          {copied ? ab('copied') : ab('copyInfo')}
+          <span aria-live="polite" className="sr-only">
+            {copied ? ab('copied') : ''}
+          </span>
+        </Button>
+      }
       footer={
-        <>
-          <Button variant="ghost" icon={<Copy size={13} />} onClick={() => void copyInfo()} disabled={!info} className="mr-auto">
-            {tx('copyInfo')}
-          </Button>
-          <Button variant="ghost" onClick={onClose}>
-            {t('common.close')}
-          </Button>
-        </>
+        <Button variant="secondary" onClick={onClose}>
+          {ab('close')}
+        </Button>
       }
     >
-      <div className="flex flex-col gap-3">
-        <div className="flex items-center gap-2">
-          <Database size={22} className="text-accent" aria-hidden />
-          <div>
-            <div className="text-[15px] font-semibold">{t('app.name')}</div>
-            <div className="text-xs text-muted-foreground">{t('app.tagline')}</div>
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center gap-3">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+            <Database size={22} strokeWidth={1.75} aria-hidden />
+          </span>
+          <div className="min-w-0">
+            <div className="text-lg font-semibold">BulkDB</div>
+            <div className="text-sm text-fg-secondary">{ab('tagline')}</div>
           </div>
         </div>
 
@@ -260,75 +218,92 @@ function AboutContent({ onClose }: { onClose: () => void }) {
             {error}
           </Notice>
         )}
-        {notice && (
-          <Notice tone="success" onClose={() => setNotice(null)}>
-            {notice}
-          </Notice>
-        )}
 
         {infoError ? (
           <Notice tone="danger">{infoError}</Notice>
         ) : !info ? (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Spinner size={12} /> {t('common.loading')}
+          <div className="flex items-center gap-2 text-sm text-fg-secondary">
+            <Spinner size={12} /> {ab('loading')}
           </div>
         ) : (
-          <dl className="grid grid-cols-[110px_minmax(0,1fr)] items-center gap-x-3 gap-y-1.5 text-[13px]">
-            <InfoRow label={tx('version')}>
-              <span className="font-mono">{info.version}</span>
+          <dl className="grid grid-cols-[110px_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-base">
+            <InfoRow label={ab('version')}>
+              <span data-selectable className="tabular-nums">
+                {info.version}
+              </span>
             </InfoRow>
-            <InfoRow label={tx('platform')}>
+            <InfoRow label={ab('platform')}>
               <span>{platformName(info.platform)}</span>
             </InfoRow>
-            <InfoRow label={tx('arch')}>
-              <span className="font-mono">{info.arch}</span>
+            <InfoRow label={ab('arch')}>
+              <span>{info.arch}</span>
             </InfoRow>
-            <FolderRow label={tx('configDir')} path={info.configDir} onOpen={(p) => void open(p)} />
-            <FolderRow label={tx('logDir')} path={info.logDir} onOpen={(p) => void open(p)} />
+            <FolderRow label={ab('configDir')} path={info.configDir} onOpen={(p) => void open(p)} />
+            <FolderRow label={ab('logDir')} path={info.logDir} onOpen={(p) => void open(p)} />
           </dl>
         )}
 
-        <section className="flex flex-col gap-1.5 border-t border-border pt-3" aria-label={tx('drivers')}>
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-medium">{tx('drivers')}</span>
+        <section aria-label={ab('drivers')} className="flex flex-col gap-1 border-t border-separator pt-3">
+          <div className="flex items-baseline gap-2">
+            <h3 className="text-sm font-semibold text-fg-secondary">{ab('drivers')}</h3>
             {drivers.length > 0 && (
-              <span className="text-xs text-muted-foreground">{tx('driversSummary', { total: drivers.length, available: availableCount })}</span>
+              <span className="text-sm text-fg-secondary">{ab('driversSummary', { total: drivers.length, available: availableCount })}</span>
             )}
           </div>
           {driversError ? (
             <Notice tone="warning">
-              {tx('noDrivers')}: {driversError}
+              {ab('noDrivers')}: {driversError}
             </Notice>
-          ) : (
-            <div className="max-h-52 overflow-auto rounded border border-border">
-              <Table columns={columns} rows={drivers} rowKey={(d) => d.id} empty={t('common.loading')} />
+          ) : drivers.length === 0 ? (
+            <div className="flex items-center gap-2 text-sm text-fg-secondary">
+              <Spinner size={12} /> {ab('loading')}
             </div>
+          ) : (
+            <ul className="list-scroll max-h-48 divide-y divide-separator">
+              {drivers.map((d) => (
+                <li key={d.id} className="flex h-(--h-row) min-w-0 items-center gap-3 text-base">
+                  <span className="min-w-0 flex-1 truncate" title={d.id}>
+                    {d.name}
+                  </span>
+                  <span className="w-28 shrink-0 truncate text-sm text-fg-secondary">{tierLabel(d.tier)}</span>
+                  <span className="flex w-20 shrink-0 justify-end">
+                    {d.available ? (
+                      <Badge tone="success">{ab('available')}</Badge>
+                    ) : (
+                      <Tooltip content={d.detail ?? d.installHint}>
+                        <Badge tone="warning">{ab('missing')}</Badge>
+                      </Tooltip>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
           )}
         </section>
 
-        <section className="flex flex-col gap-1.5 border-t border-border pt-3" aria-label={tx('diagnostics')}>
-          <div className="flex items-center gap-2">
+        <section aria-label={ab('diagnostics')} className="flex flex-col gap-2 border-t border-separator pt-3">
+          <div className="flex items-center gap-3">
             <div className="min-w-0 flex-1">
-              <div className="text-xs font-medium">{tx('diagnostics')}</div>
-              <div className="text-xs text-muted-foreground">{t('settings.diagnosticsHint')}</div>
+              <h3 className="text-sm font-semibold text-fg-secondary">{ab('diagnostics')}</h3>
+              <div className="text-sm text-fg-secondary">{ab('diagnosticsHint')}</div>
             </div>
-            <Button variant="outline" icon={<PackageOpen size={13} />} onClick={() => void createBundle()} loading={bundling}>
-              {tx('createBundle')}
+            <Button variant="secondary" icon={<PackageOpen size={14} strokeWidth={1.75} />} onClick={() => void createBundle()} loading={bundling}>
+              {ab('createBundle')}
             </Button>
           </div>
           {bundle && (
-            <Notice tone="success" title={tx('bundleDone')}>
+            <Notice tone="success" title={ab('bundleDone')}>
               <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1 break-all font-mono text-xs" data-testid="bundle-path">
+                <span className="min-w-0 flex-1 break-all text-sm" data-testid="bundle-path">
                   {bundle.path}
                 </span>
-                <Button size="sm" variant="outline" icon={<FolderOpen size={12} />} onClick={() => void reveal(bundle.path)}>
-                  {tx('openFolder')}
+                <Button size="sm" variant="secondary" icon={<FolderOpen size={14} strokeWidth={1.75} />} onClick={() => void reveal(bundle.path)}>
+                  {ab('openFolder')}
                 </Button>
               </div>
-              <div className="text-xs text-muted-foreground">
+              <div className="text-sm text-fg-secondary">
                 {formatBytes(bundle.sizeBytes)}
-                {bundle.included.length > 0 && <> · {tx('included', { list: bundle.included.join(', ') })}</>}
+                {bundle.included.length > 0 && <> · {ab('included', { list: bundle.included.join(', ') })}</>}
               </div>
             </Notice>
           )}

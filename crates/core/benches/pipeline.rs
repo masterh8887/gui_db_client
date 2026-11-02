@@ -288,7 +288,7 @@ async fn run_once(db: &Path, dataset: Dataset, out_dir: &Path, iteration: u32) -
     };
     let target = SinkTarget { dir: out_dir.to_path_buf(), stem: format!("{}_{iteration}", dataset.name()), opts };
     let sink = sink::build(&target).context("building the CSV sink")?;
-    let query = Query { sql: dataset.sql(), output: StreamOutput::Arrow };
+    let query = Query::new(dataset.sql(), StreamOutput::Arrow);
     let cancel = CancellationToken::new();
 
     let sampler = RssSampler::start()?;

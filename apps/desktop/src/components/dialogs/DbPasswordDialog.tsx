@@ -1,53 +1,37 @@
 'use client';
 
-// Password for a connection saved with "ask every time" (`savePassword = false`). The password
-// goes to the backend once, through `conn_test`; the backend keeps it in memory for the rest of
-// the session and the UI forgets it immediately. On success the action that needed it resumes.
+// Password for a connection saved with "ask every time" (DESIGN.md §5.I "Prompts", §7.1 "ui").
+// Shows the head of `ui.dbPasswordPrompts`, keyed by `prompt.id`. The password goes to the
+// backend once, through `conn_test`; the backend keeps it in memory for the session and the UI
+// forgets it at once. On success the prompt is resolved and every request merged into it resumes
+// (`resumeDbPasswordRequests`: open → workspace, browse → databases, run / explain → that tab).
+// Esc, scrim and 취소 are the cancel answer: the prompt is dropped with its requests.
 
 import { useState } from 'react';
-import { t } from '@/lib/i18n';
+import { resumeDbPasswordRequests } from '@/lib/db-password';
 import { errorText } from '@/lib/ipc-error';
-import { Button, Dialog, Field, Input, Notice } from '@/components/ui';
-import { useCatalogStore } from '@/stores/catalog';
+import { Button, EnvTag, Field, Input, Notice, Sheet } from '@/components/ui';
 import { useConnectionsStore } from '@/stores/connections';
-import { useExtractStore } from '@/stores/extract';
 import { logLocal } from '@/stores/logs';
 import { useUiStore, type DbPasswordPrompt } from '@/stores/ui';
-
-/** Continue whatever was waiting for the password. */
-function resume(prompt: DbPasswordPrompt): void {
-  switch (prompt.reason) {
-    case 'browse': {
-      const catalog = useCatalogStore.getState();
-      catalog.setExpanded(prompt.connId, true);
-      void catalog.loadDatabases(prompt.connId).catch(() => undefined);
-      break;
-    }
-    case 'run':
-      void useExtractStore.getState().run();
-      break;
-    case 'explain':
-      void useExtractStore.getState().explain();
-      break;
-    case 'test':
-      break;
-  }
-}
+import { dp } from './DbPasswordDialog.strings';
 
 export function DbPasswordDialog() {
-  const prompt = useUiStore((s) => s.dbPasswordPrompt);
+  const prompt = useUiStore((s) => s.dbPasswordPrompts[0]);
   if (!prompt) return null;
-  // Keyed so a new request always starts with an empty field and no stale error.
-  return <DbPasswordForm key={`${prompt.connId}:${prompt.reason}`} prompt={prompt} />;
+  // Keyed so a new prompt always starts with an empty field and no stale error; requests merged
+  // into this prompt keep it mounted.
+  return <DbPasswordSheet key={prompt.id} prompt={prompt} />;
 }
 
-function DbPasswordForm({ prompt }: { prompt: DbPasswordPrompt }) {
-  const close = useUiStore((s) => s.closeDbPassword);
+function DbPasswordSheet({ prompt }: { prompt: DbPasswordPrompt }) {
   const conn = useConnectionsStore((s) => s.connections.find((c) => c.id === prompt.connId));
-  const test = useConnectionsStore((s) => s.test);
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const name = conn?.name ?? prompt.connId;
+
+  const cancel = () => useUiStore.getState().resolveDbPassword(prompt.id);
 
   const submit = async () => {
     if (!secret || busy) return;
@@ -56,10 +40,12 @@ function DbPasswordForm({ prompt }: { prompt: DbPasswordPrompt }) {
     const password = secret;
     setSecret('');
     try {
-      await test(prompt.connId, password);
-      logLocal('info', `${conn?.name ?? prompt.connId}: ${t('tree.status.ok')}`);
-      close();
-      resume(prompt);
+      await useConnectionsStore.getState().test(prompt.connId, password);
+      logLocal('info', dp('unlocked', { name }));
+      // Requests may have been merged into the prompt while the test ran: resume the latest copy.
+      const latest = useUiStore.getState().dbPasswordPrompts.find((p) => p.id === prompt.id) ?? prompt;
+      useUiStore.getState().resolveDbPassword(prompt.id);
+      void resumeDbPasswordRequests(latest);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -68,46 +54,43 @@ function DbPasswordForm({ prompt }: { prompt: DbPasswordPrompt }) {
   };
 
   return (
-    <Dialog
+    <Sheet
       open
-      onOpenChange={(o) => !o && !busy && close()}
-      title={t('dbpw.title')}
       width="sm"
-      modal={busy}
+      title={dp('title')}
+      description={
+        <span className="inline-flex items-center gap-1.5">
+          <EnvTag tag={conn?.tag} variant="badge" />
+          <span>{name}</span>
+        </span>
+      }
+      dismissible={!busy}
+      onOpenChange={(o) => {
+        if (!o) cancel();
+      }}
       footer={
         <>
-          <Button variant="ghost" onClick={close} disabled={busy}>
-            {t('common.cancel')}
+          <Button variant="secondary" onClick={cancel} disabled={busy}>
+            {dp('cancel')}
           </Button>
           <Button variant="primary" onClick={() => void submit()} loading={busy} disabled={!secret}>
-            {t('dbpw.submit')}
+            {dp('submit')}
           </Button>
         </>
       }
     >
       <form
-        className="flex flex-col gap-2"
+        className="flex flex-col gap-3"
         onSubmit={(e) => {
           e.preventDefault();
           void submit();
         }}
       >
         {error && <Notice tone="danger">{error}</Notice>}
-        <Field
-          label={t('dbpw.label', { user: conn?.user ?? '', name: conn?.name ?? prompt.connId })}
-          htmlFor="db-secret"
-          hint={t('dbpw.hint')}
-        >
-          <Input
-            id="db-secret"
-            type="password"
-            autoComplete="off"
-            autoFocus
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-          />
+        <Field label={conn?.user ? dp('label', { user: conn.user, name }) : dp('labelNoUser', { name })} htmlFor="db-secret" hint={dp('hint')}>
+          <Input id="db-secret" type="password" autoComplete="off" autoFocus value={secret} onChange={(e) => setSecret(e.target.value)} />
         </Field>
       </form>
-    </Dialog>
+    </Sheet>
   );
 }

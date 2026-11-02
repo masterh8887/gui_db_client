@@ -169,11 +169,11 @@ impl Fixture {
 }
 
 fn csv_query(sql: &str, fmt: CsvFormat) -> Query {
-    Query { sql: sql.to_string(), output: StreamOutput::RawCsv(fmt) }
+    Query { sql: sql.to_string(), output: StreamOutput::RawCsv(fmt), max_batch_bytes: None }
 }
 
 fn arrow_query(sql: &str) -> Query {
-    Query { sql: sql.to_string(), output: StreamOutput::Arrow }
+    Query { sql: sql.to_string(), output: StreamOutput::Arrow, max_batch_bytes: None }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -349,7 +349,7 @@ async fn cancel_mid_stream_ends_the_server_session() {
     let pid = db.backend_pid();
     for output in [StreamOutput::RawCsv(CsvFormat::default()), StreamOutput::Arrow] {
         let cancel = CancellationToken::new();
-        let q = Query { sql: ENDLESS.into(), output };
+        let q = Query { sql: ENDLESS.into(), output, max_batch_bytes: None };
         let out = db.stream(&q, &SessionOpts::default(), cancel.clone()).await.unwrap();
         let mut stream = out.stream;
         let first = stream.next().await.expect("first batch").expect("first batch ok");
@@ -431,7 +431,7 @@ async fn dropping_the_stream_cancels_the_server_query() {
     let db = connect(&url, "bulkdb-it-drop").await;
     let pid = db.backend_pid();
     for output in [StreamOutput::RawCsv(CsvFormat::default()), StreamOutput::Arrow] {
-        let out = db.stream(&Query { sql: ENDLESS.into(), output }, &SessionOpts::default(), CancellationToken::new()).await.unwrap();
+        let out = db.stream(&Query { sql: ENDLESS.into(), output, max_batch_bytes: None }, &SessionOpts::default(), CancellationToken::new()).await.unwrap();
         let mut stream = out.stream;
         stream.next().await.expect("first batch").expect("first batch ok");
         drop(stream);
@@ -451,7 +451,7 @@ async fn pipeline_cancel_and_sink_failure_stop_the_server_query() {
     let db = connect(&url, "bulkdb-it-pipeline").await;
     let pid = db.backend_pid();
     for output in [StreamOutput::RawCsv(CsvFormat::default()), StreamOutput::Arrow] {
-        let q = Query { sql: ENDLESS.into(), output };
+        let q = Query { sql: ENDLESS.into(), output, max_batch_bytes: None };
 
         // Cancel through the job token once rows are flowing.
         let cancel = CancellationToken::new();
@@ -489,7 +489,7 @@ async fn statement_timeout_fails_as_timeout_not_cancelled() {
     let opts = SessionOpts { statement_timeout_ms: Some(1_000), ..Default::default() };
     db.apply_session(&opts).await.unwrap();
     for output in [StreamOutput::RawCsv(CsvFormat::default()), StreamOutput::Arrow] {
-        let out = db.stream(&Query { sql: ENDLESS.into(), output }, &opts, CancellationToken::new()).await.unwrap();
+        let out = db.stream(&Query { sql: ENDLESS.into(), output, max_batch_bytes: None }, &opts, CancellationToken::new()).await.unwrap();
         let mut stream = out.stream;
         let mut terminal = None;
         while let Some(item) = stream.next().await {
@@ -534,7 +534,7 @@ async fn statement_timeout_on_a_silent_statement_is_timeout() {
     let opts = SessionOpts { statement_timeout_ms: Some(500), ..Default::default() };
     db.apply_session(&opts).await.unwrap();
     for output in [StreamOutput::RawCsv(CsvFormat::default()), StreamOutput::Arrow] {
-        let q = Query { sql: "select pg_sleep(5)".into(), output };
+        let q = Query { sql: "select pg_sleep(5)".into(), output, max_batch_bytes: None };
 
         let started = Instant::now();
         let err = terminal_error(&db, &q, &opts).await;

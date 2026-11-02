@@ -16,9 +16,11 @@ import type {
   ExportRequest,
   HistoryEntry,
   HostKeyPrompt,
+  CopyJobInfo,
   ImportedConnection,
   IndexInfo,
   JobDone,
+  JobKind,
   JobProgress,
   JobResult,
   JobServer,
@@ -44,11 +46,18 @@ import type {
   TableInfo,
   TableRef,
 } from 'ipc-types';
+import { describeChar, firstNonCp949 } from './cp949';
+import { createCopyHandlers } from './mock-copy';
+import { createWindowHandlers } from './mock-windows';
+import { isEnvTag } from './env';
 import { joinPath, num, parseMemSize } from './format';
 import { IpcError } from './ipc-error';
 import {
+  LEGACY_CONN_ID,
   LOCAL_CONN_ID,
+  MYSQL8_CONN_ID,
   PROD_CONN_ID,
+  mockCatalogId,
   mockColumns,
   mockConnections,
   mockDatabases,
@@ -57,6 +66,8 @@ import {
   mockFindTable,
   mockHistory,
   mockIndexes,
+  mockLegacyConnection,
+  mockMysql8Connection,
   mockSchemas,
   mockSelectSql,
   mockSettings,
@@ -74,6 +85,7 @@ const EV = {
   tunnelHostKey: 'tunnel:hostkey',
   tunnelPassword: 'tunnel:password',
   driversChanged: 'drivers:changed',
+  connectionsChanged: 'connections:changed',
 } as const;
 
 export interface MockOptions {
@@ -118,24 +130,42 @@ const TERMINAL: JobState[] = ['done', 'cancelled', 'failed', 'rejected'];
 
 type Listener = (payload: unknown) => void;
 const listeners = new Map<string, Set<Listener>>();
+/**
+ * Per-window bus of `listenWindow` (docs/db-copy.md 1.1), by window label then event. The mock
+ * has one window, `main`.
+ */
+const windowListeners = new Map<string, Map<string, Set<Listener>>>();
 
-export function mockListen<T>(event: string, handler: (payload: T) => void): Promise<() => void> {
-  let set = listeners.get(event);
+function addListener(map: Map<string, Set<Listener>>, event: string, handler: Listener): () => void {
+  let set = map.get(event);
   if (!set) {
     set = new Set();
-    listeners.set(event, set);
+    map.set(event, set);
   }
-  const l = handler as Listener;
-  set.add(l);
-  return Promise.resolve(() => {
-    set.delete(l);
-  });
+  const s = set;
+  s.add(handler);
+  return () => {
+    s.delete(handler);
+  };
 }
 
-function emit(event: string, payload: unknown): void {
-  const set = listeners.get(event);
-  if (!set || set.size === 0) return;
-  const snapshot = [...set];
+export function mockListen<T>(event: string, handler: (payload: T) => void): Promise<() => void> {
+  return Promise.resolve(addListener(listeners, event, handler as Listener));
+}
+
+/** `listenWindow` in mock mode: listen on window `label`'s own bus. */
+export function mockListenWindow<T>(label: string, event: string, handler: (payload: T) => void): Promise<() => void> {
+  let map = windowListeners.get(label);
+  if (!map) {
+    map = new Map();
+    windowListeners.set(label, map);
+  }
+  return Promise.resolve(addListener(map, event, handler as Listener));
+}
+
+function deliver(event: string, payload: unknown, sets: (Set<Listener> | undefined)[]): void {
+  const snapshot = sets.flatMap((s) => (s ? [...s] : []));
+  if (snapshot.length === 0) return;
   queueMicrotask(() => {
     for (const l of snapshot) {
       try {
@@ -147,9 +177,22 @@ function emit(event: string, payload: unknown): void {
   });
 }
 
+/** Broadcast (`app.emit`): every listener, including every window's own bus. */
+function emit(event: string, payload: unknown): void {
+  deliver(event, payload, [listeners.get(event), ...[...windowListeners.values()].map((m) => m.get(event))]);
+}
+
+/**
+ * `emit_to(label)`: window `label`'s bus, plus the default-target listeners (Tauri 2.12 delivers
+ * an `emit_to` to `{ kind: 'Any' }` listeners too, which is why the UI uses `listenWindow`).
+ */
+function emitTo(label: string, event: string, payload: unknown): void {
+  deliver(event, payload, [listeners.get(event), windowListeners.get(label)?.get(event)]);
+}
+
 // ---- timers (all tracked so `reset()` can clear them) --------------------------------------
 
-type Handle = ReturnType<typeof setTimeout>;
+export type Handle = ReturnType<typeof setTimeout>;
 const timers = new Set<Handle>();
 
 function after(ms: number, fn: () => void): Handle {
@@ -195,6 +238,13 @@ interface MockJob {
   stepTimer?: Handle;
   serverTicks: number;
   tick: number;
+  /** Called by `job_cancel` before the job ends `cancelled` (jobs driven by `MockCtx.jobs`). */
+  onCancel?: () => void;
+  /**
+   * Called by `job_resume` of a warned job driven by `MockCtx.jobs`, once every warning of its
+   * preflight report is acknowledged, with the keys of that call (core sends them to the job).
+   */
+  onResume?: (ackKeys: string[]) => void;
 }
 
 interface PendingPrompt {
@@ -236,8 +286,13 @@ const calls: string[] = [];
 
 function freshState(): MockState {
   return {
-    connections: mockConnections(),
-    passwords: new Map([['c-prod', 'stored-in-keyring']]),
+    connections: [...mockConnections(), mockLegacyConnection(), mockMysql8Connection()],
+    passwords: new Map([
+      ['c-prod', 'stored-in-keyring'],
+      ['c-staging', 'stored-in-keyring'],
+      [LEGACY_CONN_ID, 'stored-in-keyring'],
+      [MYSQL8_CONN_ID, 'stored-in-keyring'],
+    ]),
     sessionSecrets: new Map(),
     sshSecrets: new Map(),
     drivers: mockDrivers(),
@@ -280,14 +335,10 @@ function findConn(connId: string): Connection {
   return c;
 }
 
-/**
- * Which canned catalog a connection browses: the two seeded connections have their own; any
- * connection created in the session borrows the SQLite one or the server one by driver.
- */
+/** Which canned catalog a connection browses (`mockCatalogId`: by connection, driver and MySQL server). */
 function catalogIdFor(connId: string): string {
-  if (connId === PROD_CONN_ID || connId === LOCAL_CONN_ID) return connId;
-  const driver = state.connections.find((c) => c.id === connId)?.driver;
-  return driver === 'sqlite' ? LOCAL_CONN_ID : PROD_CONN_ID;
+  const conn = state.connections.find((c) => c.id === connId);
+  return conn ? mockCatalogId(conn) : connId === LOCAL_CONN_ID ? connId : PROD_CONN_ID;
 }
 
 /** Whether the connection's driver authenticates with a password (registry `fields`). */
@@ -307,7 +358,24 @@ function requireAuth(conn: Connection, password?: string): void {
 
 /** Remember a password typed for an "ask every time" connection (core `remember_secret`). */
 function rememberSecret(conn: Connection, password?: string): void {
-  if (password && !conn.savePassword) state.sessionSecrets.set(conn.id, password);
+  if (password && !conn.savePassword && state.sessionSecrets.get(conn.id) !== password) {
+    state.sessionSecrets.set(conn.id, password);
+    // A newly typed session password is process-wide: announce it so other windows' flag updates.
+    emit(EV.connectionsChanged, null);
+  }
+}
+
+/**
+ * Mirror of core `with_secret_flags`: the secret flags are recomputed from the "keyring" and
+ * session memory on every read, never read back from the stored connection.
+ */
+function withSecretFlags(c: Connection): Connection {
+  return {
+    ...c,
+    hasPassword: state.passwords.has(c.id),
+    hasSshSecret: state.sshSecrets.has(c.id),
+    ...(state.sessionSecrets.has(c.id) ? { hasSessionPassword: true } : {}),
+  };
 }
 
 function connLabel(c: Connection): string {
@@ -464,7 +532,145 @@ function referencedTable(connId: string, sql: string): { ref: TableRef; info?: T
   return { ref, info };
 }
 
+// ---- MySQL compatibility (docs/mysql-compat.md; core `mysql_dispatch`) ----------------------
+
+const PROTOCOL_ALIASES: Record<string, 'auto' | 'modern' | 'legacy'> = {
+  '': 'auto',
+  auto: 'auto',
+  modern: 'modern',
+  '4.1': 'modern',
+  new: 'modern',
+  legacy: 'legacy',
+  '4.0': 'legacy',
+  old: 'legacy',
+  pre41: 'legacy',
+};
+const ENCODING_ALIASES: Record<string, 'auto' | 'utf8' | 'euc-kr' | 'latin1'> = {
+  '': 'auto',
+  auto: 'auto',
+  utf8: 'utf8',
+  'utf-8': 'utf8',
+  utf8mb4: 'utf8',
+  'euc-kr': 'euc-kr',
+  euckr: 'euc-kr',
+  euc_kr: 'euc-kr',
+  cp949: 'euc-kr',
+  ksc5601: 'euc-kr',
+  latin1: 'latin1',
+  'windows-1252': 'latin1',
+  cp1252: 'latin1',
+};
+const BOOL_VALUES: Record<string, boolean> = { '': false, true: true, '1': true, yes: true, on: true, false: false, '0': false, no: false, off: false };
+
+interface MysqlOpts {
+  protocol: 'auto' | 'modern' | 'legacy';
+  encoding: 'auto' | 'utf8' | 'euc-kr' | 'latin1';
+  allowOldPassword: boolean;
+}
+
+/** Core `MysqlConnOpts::from_params`: every value validated, an unknown one is `INVALID` naming the field. */
+function mysqlOpts(conn: Connection): MysqlOpts {
+  const raw = (k: string) => (conn.fields[k] ?? '').trim();
+  const protocol = PROTOCOL_ALIASES[raw('protocol').toLowerCase()];
+  if (!protocol) throw err('INVALID', `mysql field protocol: unknown value '${raw('protocol')}' (use auto, modern or legacy)`);
+  const encoding = ENCODING_ALIASES[raw('encoding').toLowerCase()];
+  if (!encoding) throw err('INVALID', `mysql field encoding: unknown value '${raw('encoding')}' (use auto, utf8, euc-kr or latin1)`);
+  const allowOldPassword = BOOL_VALUES[raw('allow_old_password').toLowerCase()];
+  if (allowOldPassword === undefined) {
+    throw err('INVALID', `mysql field allow_old_password: unknown value '${raw('allow_old_password')}' (use true or false)`);
+  }
+  return { protocol, encoding, allowOldPassword };
+}
+
+/** The mock's pre-4.1 servers: pinned `legacy`, or `auto` against a host named legacy-*. */
+function isLegacyServer(conn: Connection, o: MysqlOpts): boolean {
+  return o.protocol === 'legacy' || (o.protocol === 'auto' && /legacy/i.test(conn.host ?? ''));
+}
+
+/**
+ * The charset SQL is sent in (core `Source::sql_charset`): EUC-KR for an `euc-kr` connection
+ * and for `auto` on the mock's pre-4.1 server (whose `character_set` is `euc_kr`); `null` = UTF-8.
+ */
+function sqlCharsetEucKr(conn: Connection): boolean {
+  if (conn.driver !== 'mysql') return false;
+  const o = mysqlOpts(conn);
+  return o.encoding === 'euc-kr' || (o.encoding === 'auto' && isLegacyServer(conn, o));
+}
+
+function mysqlServerInfo(conn: Connection): ServerInfo {
+  const o = mysqlOpts(conn);
+  const legacy = isLegacyServer(conn, o);
+  const eucKr = sqlCharsetEucKr(conn);
+  // A 4.1+ server whose default character set is latin1 (the mock: a host named *latin1*).
+  const latin1 = !legacy && /latin1/i.test(conn.host ?? '');
+  const textPlan = legacy
+    ? `pre-4.1 server: text decoded as ${eucKr ? 'EUC-KR (CP949)' : o.encoding === 'utf8' ? 'UTF-8' : 'latin1 (windows-1252)'}`
+    : eucKr
+      ? `no server-side conversion (character_set_results = NULL, client charset ${latin1 ? 'latin1' : 'euckr'}); non-UTF-8 text decoded as EUC-KR (CP949)`
+      : 'server converts text to UTF-8 (SET NAMES utf8mb4)';
+  // Core `mysql_dispatch::plan_text`: only with `encoding = auto`.
+  const planNote = latin1 && o.encoding === 'auto' ? ['default character set is latin1: if Korean text looks broken, set the connection encoding to euc-kr'] : [];
+  const version = legacy ? '4.0.27-standard-log' : '8.0.36';
+  return {
+    driver: 'mysql',
+    version,
+    user: conn.user,
+    database: conn.database,
+    ramBytes: BigInt(SERVER_RAM_BYTES),
+    ramSource: 'innodb_buffer_pool_size x 2',
+    settings: {
+      version,
+      character_set_server: legacy ? 'euc_kr' : latin1 ? 'latin1' : 'utf8mb4',
+      protocol: legacy ? 'legacy (pre-4.1)' : 'modern',
+      text_plan: textPlan,
+      max_execution_time: legacy ? 'n/a' : '0',
+    },
+    canWrite: false,
+    notes: legacy ? [`Pre-4.1 protocol: ${textPlan}`, 'No session time limits on MySQL 4.0'] : [...planNote, 'Read-only role: recommended for extraction'],
+  };
+}
+
+/** Core `export::build_target` / `CsvSink::validate` + `preflight::check_output_encoding`. */
+function checkCsvEncoding(req: ExportRequest): PreflightIssue | null {
+  const csv = req.output.csv;
+  if (req.output.format !== 'csv' || csv?.encoding !== 'euc-kr') return null;
+  if (/^[A-Za-z]$/.test(csv.delimiter)) {
+    throw err('INVALID', `csv delimiter '${csv.delimiter}' cannot be used with the euc-kr encoding (CP949 characters contain ASCII letters as their second byte)`);
+  }
+  const bad = firstNonCp949(csv.nullAs);
+  if (!bad) return null;
+  const cp = (bad.ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0');
+  return {
+    code: 'CSV_ENCODING',
+    severity: 'danger',
+    message: `The NULL text contains '${bad.ch}' (U+${cp}), which EUC-KR (CP949) cannot represent: NULL would be written as '?' and could not be told apart from data.`,
+    detail: 'csv.nullAs with csv.encoding = euc-kr',
+    recommendation: 'Change the NULL text (e.g. empty, NULL or \\N) or write the file as UTF-8.',
+  };
+}
+
+/** Core `preflight::check_sql_encoding` for an EUC-KR connection. */
+function checkSqlEncoding(conn: Connection, sql: string): PreflightIssue | null {
+  if (!sqlCharsetEucKr(conn)) return null;
+  const bad = firstNonCp949(sql);
+  if (!bad) return null;
+  return {
+    code: 'SQL_ENCODING',
+    severity: 'danger',
+    message: `The SQL contains ${describeChar(bad.ch)} at line ${bad.line}, column ${bad.column}, which the connection character set EUC-KR (CP949) cannot represent.`,
+    detail: `line ${bad.line}, column ${bad.column}`,
+    recommendation: 'Remove or replace the character, or choose a connection encoding that can represent it.',
+  };
+}
+
+/** Core `encoding::unmappable_note` (the mock's EUC-KR exports always replace a few characters). */
+export const MOCK_UNMAPPABLE_CHARS = 3;
+function unmappableNote(count: number): string {
+  return `${count} character(s) cannot be represented in EUC-KR (CP949) and were written as '?'`;
+}
+
 function serverInfo(conn: Connection): ServerInfo {
+  if (conn.driver === 'mysql') return mysqlServerInfo(conn);
   if (conn.driver === 'sqlite') {
     return {
       driver: 'sqlite',
@@ -625,10 +831,15 @@ function buildPreflight(conn: Connection, req: ExportRequest): PreflightReport {
   const check = mockSqlCheck(sql, mockDialect(conn.driver));
   const blockers: PreflightIssue[] = [...check.issues];
   const warnings: PreflightIssue[] = [];
+  const csvIssue = checkCsvEncoding(req);
+  if (csvIssue) blockers.push(csvIssue);
+  // Never an acknowledgeable warning; EXPLAIN is skipped (the statement cannot be sent).
+  const sqlIssue = check.ok ? checkSqlEncoding(conn, sql) : null;
+  if (sqlIssue) blockers.push(sqlIssue);
   const label = deriveLabel(req, conn.id);
   const outputPath = resolveOutputPath(conn, req, label);
   const { ref, info } = referencedTable(conn.id, sql);
-  const plan = check.ok ? buildPlan(conn.id, sql, false) : undefined;
+  const plan = check.ok && !sqlIssue ? buildPlan(conn.id, sql, false) : undefined;
   const rows = num(plan?.estimatedRows) ?? options.totalRows;
   const width = plan?.estimatedWidth ?? options.rowWidth;
   const bytes = rows * width;
@@ -776,13 +987,18 @@ function progressTick(job: MockJob): void {
     log('info', `Flushing ${job.outputPath}`, job.summary.id, 'bulkdb::sink');
     job.stepTimer = after(options.finishingMs, () => {
       const durationMs = Date.now() - job.startedMs;
+      const csv = job.req?.output.format === 'csv' ? job.req.output.csv : undefined;
       const result: JobResult = {
         rows: BigInt(job.rows),
         bytes: BigInt(job.rows * options.rowWidth),
         files: [job.outputPath],
         durationMs: BigInt(durationMs),
         verifiedRows: state.settings.verifyAfterExport ? BigInt(job.rows) : undefined,
-        notes: [job.req?.output.format === 'parquet' ? 'Parquet row groups: 128 MB' : 'CSV header written', 'File sizes verified on disk'],
+        notes: [
+          job.req?.output.format === 'parquet' ? 'Parquet row groups: 128 MB' : 'CSV header written',
+          'File sizes verified on disk',
+          ...(csv?.encoding === 'euc-kr' ? [unmappableNote(MOCK_UNMAPPABLE_CHARS)] : []),
+        ],
       };
       state.writtenFiles.add(job.outputPath);
       log('info', `Done: ${job.rows.toLocaleString('en-US')} rows -> ${job.outputPath}`, job.summary.id, 'bulkdb::job');
@@ -884,6 +1100,7 @@ function cancelJob(id: string): void {
   if (TERMINAL.includes(job.summary.state)) throw err('INVALID', `Job ${id} is already ${job.summary.state}`);
   const started = job.runStartMs !== undefined;
   clearJobTimers(job);
+  job.onCancel?.();
   const result: JobResult | undefined = started && job.req
     ? {
         rows: BigInt(job.rows),
@@ -906,6 +1123,12 @@ function resumeJob(id: string, acks: string[]): void {
   const unacked = (report?.warnings ?? []).filter((w) => !job.acks.has(w.code)).map((w) => w.code);
   if (unacked.length > 0) throw err('INVALID', `Warnings not acknowledged: ${unacked.join(', ')}`);
   log('info', `Warnings acknowledged: ${[...job.acks].join(', ')}`, id, 'bulkdb::preflight');
+  if (job.onResume) {
+    const resume = job.onResume;
+    job.onResume = undefined;
+    resume([...acks]);
+    return;
+  }
   beginRunning(job);
 }
 
@@ -1007,6 +1230,8 @@ async function probe(conn: Connection, password?: string): Promise<ProbeResult> 
     steps.push('tunnel');
     log('info', `ssh -N -L 127.0.0.1:0:${conn.host}:${conn.port} ${conn.ssh.user}@${conn.ssh.host}`, undefined, 'bulkdb::tunnel');
   }
+  // Like core: field values are validated before any socket is opened.
+  if (conn.driver === 'mysql') mysqlOpts(conn);
   requireAuth(conn, password);
   if (password === 'wrong') throw err('AUTH', `password authentication failed for user "${conn.user}"`);
   await sleep(options.latencyMs * 4);
@@ -1030,6 +1255,32 @@ async function probe(conn: Connection, password?: string): Promise<ProbeResult> 
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown | Promise<unknown>;
+
+/** Whether a save points a connection at another server or database (core `endpoint_changed`). */
+function endpointChanged(a: Connection, b: Connection): boolean {
+  const ssh = (c: Connection) => (c.ssh?.enabled ? `${c.ssh.host}:${c.ssh.port}:${c.ssh.user}` : '');
+  return (
+    a.driver !== b.driver ||
+    (a.host ?? '') !== (b.host ?? '') ||
+    (a.port ?? 0) !== (b.port ?? 0) ||
+    (a.database ?? '') !== (b.database ?? '') ||
+    (a.fields.path ?? '') !== (b.fields.path ?? '') ||
+    (a.fields.connection_string ?? '') !== (b.fields.connection_string ?? '') ||
+    ssh(a) !== ssh(b)
+  );
+}
+
+/**
+ * `writeAllowed` after a save (core `resolve_write_allowed`): a new connection never starts
+ * write-allowed; `true` sets it on an existing one; `false` clears; absent keeps it unless the
+ * endpoint changed.
+ */
+function resolveWriteAllowed(existing: Connection | undefined, input: Connection): boolean {
+  if (!existing) return false;
+  if (input.writeAllowed === true) return true;
+  if (input.writeAllowed === false) return false;
+  return existing.writeAllowed === true && !endpointChanged(existing, input);
+}
 
 function str(args: Args, key: string): string {
   const v = args[key];
@@ -1071,12 +1322,8 @@ const handlers: Record<string, Handler> = {
     return state.drivers;
   },
 
-  conn_list: () => state.connections,
-  conn_get: (a): Connection => {
-    const c = findConn(str(a, 'connId'));
-    // Like core `with_secret_flags`: the flags are read from the "keyring" on every call.
-    return { ...c, hasPassword: state.passwords.has(c.id), hasSshSecret: state.sshSecrets.has(c.id) };
-  },
+  conn_list: () => state.connections.map(withSecretFlags),
+  conn_get: (a): Connection => withSecretFlags(findConn(str(a, 'connId'))),
   conn_save: (a) => {
     const input = a.input as ConnectionInput | undefined;
     if (!input) throw err('INVALID', 'Missing argument: input');
@@ -1102,7 +1349,13 @@ const handlers: Record<string, Handler> = {
       state.sessionSecrets.delete(id);
     }
     if (input.clearSshSecret) state.sshSecrets.delete(id);
+    // Environment tag (DESIGN.md §7.2): copied from the input; omitting it clears it.
+    const tag: unknown = input.tag;
+    // Write-allowed (DB copy target): the rules of core `ConfigStore::upsert`.
+    const writeAllowed = resolveWriteAllowed(existing, input);
     const conn: Connection = {
+      ...(isEnvTag(tag) ? { tag } : {}),
+      ...(writeAllowed ? { writeAllowed: true } : {}),
       id,
       name: input.name.trim(),
       driver: input.driver,
@@ -1121,7 +1374,9 @@ const handlers: Record<string, Handler> = {
     if (existing) state.connections = state.connections.map((c) => (c.id === id ? conn : c));
     else state.connections = [...state.connections, conn];
     log('info', `Connection ${existing ? 'updated' : 'created'}: ${conn.name} (password ${conn.hasPassword ? 'in keyring' : 'not stored'})`, undefined, 'bulkdb::config');
-    return conn;
+    // Like core `conn_save`: every save tells the other windows (db-copy.md 1.2).
+    emit(EV.connectionsChanged, null);
+    return withSecretFlags(conn);
   },
   conn_delete: (a) => {
     const id = str(a, 'connId');
@@ -1131,6 +1386,7 @@ const handlers: Record<string, Handler> = {
     state.sessionSecrets.delete(id);
     state.sshSecrets.delete(id);
     log('info', `Connection deleted: ${id}`, undefined, 'bulkdb::config');
+    emit(EV.connectionsChanged, null);
   },
   conn_test: (a) => probe(findConn(str(a, 'connId')), optStr(a, 'password')),
   conn_import_dbeaver: (a): ImportedConnection[] => {
@@ -1289,6 +1545,115 @@ const handlers: Record<string, Handler> = {
   },
 };
 
+// ---- feature mocks (docs/db-copy.md 10.1) ----------------------------------------------------
+
+export type MockArgs = Args;
+export type MockHandler = Handler;
+
+/** What a feature mock (`mock-copy.ts`, `mock-windows.ts`) returns to the dispatcher. */
+export interface MockFeature {
+  handlers: Record<string, MockHandler>;
+  /** Forget all state (called by `mockBackend.reset()`; timers are already cleared). */
+  reset(): void;
+}
+
+/** The fake backend's services, handed to the feature mocks. */
+export interface MockCtx {
+  /** Broadcast an event to every window. */
+  emit(event: string, payload: unknown): void;
+  /** Send an event to one window (`emit_to`). */
+  emitTo(label: string, event: string, payload: unknown): void;
+  log(level: LogLevel, message: string, jobId?: string, target?: string): void;
+  /** The saved connection or `NOT_FOUND`. */
+  findConn(connId: string): Connection;
+  nowIso(): string;
+  after(ms: number, fn: () => void): Handle;
+  every(ms: number, fn: () => void): Handle;
+  clear(h: Handle | undefined): void;
+  /** `IpcError` with an `ErrorPayload`. */
+  error(code: string, message: string, detail?: string): IpcError;
+  options(): MockOptions;
+  jobs: {
+    /** Create a job in `pending` (emits `job:state`); returns its id. */
+    create(kind: JobKind, connId: string, label: string, copy?: CopyJobInfo): string;
+    get(jobId: string): JobSummary | undefined;
+    setState(jobId: string, s: JobState): void;
+    finish(jobId: string, s: JobState, out?: { result?: JobResult; error?: ErrorPayload }): void;
+    setProgress(jobId: string, p: JobProgress): void;
+    /**
+     * The report a warned job waits on (`job_get` returns it): one warning per acknowledgement
+     * still needed, its `code` being the key `job_resume` must name.
+     */
+    setPreflight(jobId: string, report: PreflightReport): void;
+    /** Run `fn` when `job_cancel` cancels this job (before it ends `cancelled`). */
+    onCancel(jobId: string, fn: () => void): void;
+    /**
+     * Run `fn(ackKeys)` when `job_resume` lets this warned job continue (every warning of its
+     * report acknowledged; otherwise `job_resume` is `INVALID` and the job keeps waiting).
+     */
+    onResume(jobId: string, fn: (ackKeys: string[]) => void): void;
+  };
+}
+
+function ctxJob(jobId: string): MockJob {
+  const job = state.jobs.get(jobId);
+  if (!job) throw err('NOT_FOUND', `Job ${jobId} not found`);
+  return job;
+}
+
+const ctx: MockCtx = {
+  emit,
+  emitTo,
+  log,
+  findConn,
+  nowIso,
+  after,
+  every,
+  clear: clearHandle,
+  error: err,
+  options: () => options,
+  jobs: {
+    create(kind, connId, label, copy) {
+      const conn = findConn(connId);
+      const id = nextId('job');
+      const job: MockJob = {
+        summary: { id, kind, state: 'pending', connId: conn.id, connName: conn.name, label, startedAt: nowIso(), ...(copy ? { copy } : {}) },
+        acks: new Set(),
+        startedMs: Date.now(),
+        rows: 0,
+        totalRows: 0,
+        outputPath: '',
+        serverTicks: 0,
+        tick: 0,
+      };
+      state.jobs.set(id, job);
+      setState(job, 'pending');
+      return id;
+    },
+    get: (jobId) => state.jobs.get(jobId)?.summary,
+    setState: (jobId, s) => setState(ctxJob(jobId), s),
+    finish: (jobId, s, out = {}) => finish(ctxJob(jobId), s, out),
+    setProgress(jobId, p) {
+      const job = ctxJob(jobId);
+      job.summary.progress = p;
+      emit(EV.jobProgress, p);
+    },
+    setPreflight(jobId, report) {
+      ctxJob(jobId).summary.preflight = report;
+    },
+    onCancel(jobId, fn) {
+      ctxJob(jobId).onCancel = fn;
+    },
+    onResume(jobId, fn) {
+      ctxJob(jobId).onResume = fn;
+    },
+  },
+};
+
+const copyMock: MockFeature = createCopyHandlers(ctx);
+const windowsMock: MockFeature = createWindowHandlers(ctx);
+Object.assign(handlers, copyMock.handlers, windowsMock.handlers);
+
 /** Dispatch one command. Unknown commands and handler errors reject with `IpcError`. */
 export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   calls.push(cmd);
@@ -1328,8 +1693,11 @@ export const mockBackend = {
     }
     timers.clear();
     listeners.clear();
+    windowListeners.clear();
     for (const p of state.prompts.values()) p.resolve(undefined);
     state = freshState();
+    copyMock.reset();
+    windowsMock.reset();
     options = { ...DEFAULT_OPTIONS };
     calls.length = 0;
     seedLogs();
@@ -1337,6 +1705,10 @@ export const mockBackend = {
   /** Push an event to listeners as the shell would. */
   emit(event: string, payload: unknown): void {
     emit(event, payload);
+  },
+  /** Push a window-targeted event (`emit_to`) as the shell would. */
+  emitTo(label: string, event: string, payload: unknown): void {
+    emitTo(label, event, payload);
   },
   getJob(id: string): JobSummary | undefined {
     return state.jobs.get(id)?.summary;

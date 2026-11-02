@@ -34,7 +34,7 @@ fn params(path: &str) -> ConnectParams {
 }
 
 fn query(sql: &str) -> Query {
-    Query { sql: sql.to_string(), output: StreamOutput::Arrow }
+    Query { sql: sql.to_string(), output: StreamOutput::Arrow, max_batch_bytes: None }
 }
 
 /// Fixture file in a fresh temp dir; the dir must outlive the connection.

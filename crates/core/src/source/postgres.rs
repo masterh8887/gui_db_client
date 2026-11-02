@@ -47,7 +47,7 @@ use super::arrow_batch::{schema_from, ArrowBatcher, Cell, ColKind};
 use super::{Batch, BoxStream, ConnectParams, CsvFormat, Database, Query, Source, SourceStream, SslMode, StreamOutput};
 use crate::error::{CoreError, Result};
 use crate::types::{PlanNode, PlanSummary, ServerInfo, SessionOpts, TableRef};
-use crate::{BATCH_BYTES, BATCH_ROWS};
+use crate::BATCH_ROWS;
 
 /// Statement timeout for planner-only `EXPLAIN` (spec: 15 s).
 pub const EXPLAIN_TIMEOUT: &str = "15s";
@@ -1141,18 +1141,26 @@ struct CsvBatcher {
     rows: u64,
     total_rows: u64,
     crlf: bool,
+    /// Byte limit of one batch (`Query::batch_bytes`).
+    max_bytes: usize,
 }
 
 impl CsvBatcher {
+    #[cfg(test)]
     fn new(crlf: bool) -> Self {
-        CsvBatcher { buf: BytesMut::with_capacity(BATCH_BYTES), rows: 0, total_rows: 0, crlf }
+        Self::with_limit(crlf, crate::BATCH_BYTES)
+    }
+
+    fn with_limit(crlf: bool, max_bytes: usize) -> Self {
+        let max_bytes = max_bytes.max(1);
+        CsvBatcher { buf: BytesMut::with_capacity(max_bytes), rows: 0, total_rows: 0, crlf, max_bytes }
     }
 
     /// Add one row; returns a batch when one is complete.
     fn push(&mut self, msg: &[u8]) -> Option<Batch> {
         // `append_csv_line` adds at most one byte (`\n` -> `\r\n`).
         let grow = msg.len() + usize::from(self.crlf);
-        if self.rows > 0 && self.buf.len() + grow > BATCH_BYTES {
+        if self.rows > 0 && self.buf.len() + grow > self.max_bytes {
             // The row does not fit: ship what we have and start the next batch with it. A row
             // that alone exceeds the limit is shipped by the next push (or `finish`) on its own.
             let full = self.take();
@@ -1162,7 +1170,7 @@ impl CsvBatcher {
         }
         append_csv_line(&mut self.buf, msg, self.crlf);
         self.rows += 1;
-        if self.rows >= BATCH_ROWS as u64 || self.buf.len() >= BATCH_BYTES {
+        if self.rows >= BATCH_ROWS as u64 || self.buf.len() >= self.max_bytes {
             return Some(self.take());
         }
         None
@@ -1174,7 +1182,7 @@ impl CsvBatcher {
     }
 
     fn take(&mut self) -> Batch {
-        let data = std::mem::replace(&mut self.buf, BytesMut::with_capacity(BATCH_BYTES)).freeze();
+        let data = std::mem::replace(&mut self.buf, BytesMut::with_capacity(self.max_bytes)).freeze();
         let rows = self.rows;
         self.total_rows += rows;
         self.rows = 0;
@@ -1700,14 +1708,14 @@ impl Source for PgDatabase {
                 let copy = self.with_cancel(self.client.copy_out(copy_sql.as_str()), &cancel).await.map_err(|e| clock.refine(e))?;
                 let state = CsvState {
                     copy: Box::pin(copy),
-                    batcher: CsvBatcher::new(fmt.crlf),
+                    batcher: CsvBatcher::with_limit(fmt.crlf, q.batch_bytes()),
                     expect_header: fmt.header,
                     cancel,
                     server: CancelOnDrop::new(self.canceller.clone()),
                     clock,
                     done: false,
                 };
-                Ok(SourceStream { schema: None, stream: csv_stream(state) })
+                Ok(SourceStream { schema: None, stream: csv_stream(state), replaced: None })
             }
             StreamOutput::Arrow => {
                 let clock = StatementClock::start(opts);
@@ -1725,7 +1733,7 @@ impl Source for PgDatabase {
                 let cols: Vec<(String, ColKind)> = plans.iter().map(|p| (p.name.clone(), p.kind)).collect();
                 let schema = schema_from(&cols);
                 let kinds: Vec<ColKind> = plans.iter().map(|p| p.kind).collect();
-                let batcher = ArrowBatcher::new(schema.clone(), kinds);
+                let batcher = ArrowBatcher::with_limits(schema.clone(), kinds, BATCH_ROWS, q.batch_bytes());
                 let decoder = BinaryCopyDecoder::new(plans.iter().map(|p| (p.wire, p.kind)).collect());
                 let state = ArrowState {
                     copy: Box::pin(copy),
@@ -1737,7 +1745,7 @@ impl Source for PgDatabase {
                     clock,
                     done: false,
                 };
-                Ok(SourceStream { schema: Some(schema), stream: arrow_stream(state) })
+                Ok(SourceStream { schema: Some(schema), stream: arrow_stream(state), replaced: None })
             }
         }
     }
@@ -1773,6 +1781,10 @@ impl Source for PgDatabase {
         Some(self.pid.to_string())
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn driver_id(&self) -> &'static str {
         "postgres"
     }
@@ -1791,6 +1803,7 @@ impl Database for PgDatabase {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BATCH_BYTES;
     use arrow_array::{Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 
     // ----------------------------------------------------------------------- byte builders

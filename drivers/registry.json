@@ -13,8 +13,13 @@
     "name": "MySQL / MariaDB",
     "tier": "builtin",
     "source": "mysql",
-    "fields": ["host", "port", "database", "user", "password", "sslmode"],
-    "defaults": { "port": "3306", "sslmode": "prefer" },
+    "fields": ["host", "port", "database", "user", "password", "sslmode", "protocol", "encoding", "allow_old_password"],
+    "defaults": { "port": "3306", "sslmode": "prefer", "protocol": "auto", "encoding": "auto", "allow_old_password": "false" },
+    "choices": {
+      "sslmode": ["disable", "prefer", "require", "verify-full"],
+      "protocol": ["auto", "modern", "legacy"],
+      "encoding": ["auto", "utf8", "euc-kr", "latin1"]
+    },
     "session_opts": ["max_execution_time", "net_read_timeout", "fetch_batch"]
   },
   {

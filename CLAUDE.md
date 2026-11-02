@@ -38,6 +38,7 @@ Also: protect the server — preflight checks `work_mem` vs RAM, concurrent sess
 plans; warnings must be acknowledged, blockers reject. Secrets only in the OS keyring, never in
 config/logs/IPC. Extraction SQL is a single `SELECT`/CTE; DML/DDL rejected. Data rows never
 cross IPC. No data preview anywhere. Row counts are estimates unless the user clicks "count".
+DB copy (docs/db-copy.md) is the only writer: generated SQL, write-allowed targets only.
 
 ## Commands
 
@@ -78,6 +79,14 @@ queue on the build lock (that is fine).
 - Frontend: TypeScript strict, zustand stores in `src/stores`, components in
   `src/components`, IPC only through `src/lib/ipc.ts`. 13px font, 28px rows. State of record is
   Rust: the UI renders `job:*` events and never changes job state on its own.
+- Encoding and legacy MySQL: the design lives in `docs/mysql-compat.md` (pre-4.1 client,
+  old passwords, EUC-KR servers, CSV output encoding). The mysql registry fields `protocol`,
+  `encoding`, `allow_old_password` reach the UI as `DriverInfo.choices` and render in the
+  connection sheet's 호환성 section; `CsvOpts.encoding` is absent for UTF-8 (never send
+  `"utf-8"`), EUC-KR never carries a BOM, Parquet is always UTF-8. Unmappable output
+  characters become `?` and are counted in the job notes, never a failure; SQL the connection
+  charset cannot represent is the `SQL_ENCODING` blocker. Keep `mock-data.ts` in step with
+  `drivers/registry.json` (a test compares them).
 - Keep files you do not own untouched when working in parallel with other agents; add new
   modules rather than editing shared ones, and never run `pnpm add` without coordination
   (the lockfile is shared).

@@ -86,6 +86,14 @@ function withoutPrefix<T>(rec: Record<string, T>, prefix: string): Record<string
   return out;
 }
 
+/** Loads in flight per key: a second request for the same node joins the first one. */
+const inflight = new Map<string, Promise<unknown>>();
+
+/** Tests: forget loads in flight (a mock reset leaves them pending forever). */
+export function __resetCatalogForTests(): void {
+  inflight.clear();
+}
+
 export const useCatalogStore = create<CatalogState>()((set, get) => {
   const setLoading = (key: string, on: boolean) =>
     set((s) => {
@@ -101,9 +109,6 @@ export const useCatalogStore = create<CatalogState>()((set, get) => {
       else delete errors[key];
       return { errors };
     });
-
-  /** Loads in flight per key: a second request for the same node joins the first one. */
-  const inflight = new Map<string, Promise<unknown>>();
 
   function run<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const pending = inflight.get(key);

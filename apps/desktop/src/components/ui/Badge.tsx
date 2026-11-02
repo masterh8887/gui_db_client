@@ -2,25 +2,37 @@ import { cva, type VariantProps } from 'class-variance-authority';
 import type { HTMLAttributes } from 'react';
 import { cn } from '@/lib/utils';
 
+/** Soft-tinted chip, no border, 18px; 11px Latin, 12px when the text holds Hangul (pass `hangul`). */
 export const badgeVariants = cva(
-  'inline-flex h-[18px] shrink-0 items-center gap-1 whitespace-nowrap rounded-sm border px-1.5 text-[11px] font-medium leading-none tabular-nums',
+  'inline-flex h-[18px] shrink-0 items-center gap-1 whitespace-nowrap rounded-sm px-1.5 font-medium leading-none tabular-nums',
   {
     variants: {
       tone: {
-        neutral: 'border-border bg-muted text-muted-foreground',
-        accent: 'border-accent/40 bg-accent/10 text-accent',
-        success: 'border-success/40 bg-success/10 text-success',
-        warning: 'border-warning/40 bg-warning/10 text-warning',
-        danger: 'border-danger/40 bg-danger/10 text-danger',
-        outline: 'border-border bg-transparent text-foreground',
+        neutral: 'bg-control text-fg-secondary',
+        accent: 'bg-accent-soft text-accent',
+        success: 'bg-success-soft text-success',
+        warning: 'bg-warning-soft text-warning',
+        danger: 'bg-danger-soft text-danger',
+        outline: 'bg-transparent text-fg-secondary shadow-[inset_0_0_0_1px_var(--separator-strong)]',
+      },
+      hangul: {
+        true: 'text-sm',
+        false: 'text-xs',
       },
     },
-    defaultVariants: { tone: 'neutral' },
+    defaultVariants: { tone: 'neutral', hangul: false },
   },
 );
 
 export interface BadgeProps extends HTMLAttributes<HTMLSpanElement>, VariantProps<typeof badgeVariants> {}
 
-export function Badge({ className, tone, ...rest }: BadgeProps) {
-  return <span className={cn(badgeVariants({ tone }), className)} {...rest} />;
+const HANGUL = /[ㄱ-힝]/;
+
+export function Badge({ className, tone, hangul, children, ...rest }: BadgeProps) {
+  const isHangul = hangul ?? (typeof children === 'string' && HANGUL.test(children));
+  return (
+    <span className={cn(badgeVariants({ tone, hangul: isHangul }), className)} {...rest}>
+      {children}
+    </span>
+  );
 }

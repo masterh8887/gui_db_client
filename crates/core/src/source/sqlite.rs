@@ -38,7 +38,7 @@ use crate::catalog::Catalog;
 use crate::error::{CoreError, Result};
 use crate::monitor::{JobHandle, Monitor, ServerSnapshot};
 use crate::types::{ColumnInfo, DatabaseInfo, IndexInfo, PlanNode, PlanSummary, SchemaInfo, ServerInfo, SessionInfo, SessionOpts, TableInfo, TableKind, TableRef};
-use crate::{BATCH_BYTES, BATCH_ROWS};
+use crate::BATCH_ROWS;
 
 /// Batches in flight between the reader thread and the async stream. Small on purpose: the
 /// job pipeline adds its own channel of `CHANNEL_DEPTH`; this one only decouples the
@@ -286,13 +286,14 @@ impl Source for SqliteDatabase {
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef>>();
         let (tx, rx) = mpsc::channel::<Result<Batch>>(STREAM_CHANNEL_DEPTH);
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || read_rows(conn, sql, max_rows, abort, Reply { schema_tx: Some(schema_tx), tx }, watcher));
+        let limits = (max_rows, q.batch_bytes());
+        tokio::task::spawn_blocking(move || read_rows(conn, sql, limits, abort, Reply { schema_tx: Some(schema_tx), tx }, watcher));
         let schema = match schema_rx.await {
             Ok(Ok(schema)) => schema,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(CoreError::Internal("sqlite reader thread exited before sending the schema".into())),
         };
-        Ok(SourceStream { schema: Some(schema), stream: batch_stream(rx, cancel, drop_guard) })
+        Ok(SourceStream { schema: Some(schema), stream: batch_stream(rx, cancel, drop_guard), replaced: None })
     }
 
     /// `EXPLAIN QUERY PLAN`. SQLite has no `EXPLAIN ANALYZE`; `analyze` is ignored and the
@@ -332,6 +333,10 @@ impl Source for SqliteDatabase {
 
     fn session_id(&self) -> Option<String> {
         None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn driver_id(&self) -> &'static str {
@@ -377,14 +382,15 @@ impl Reply {
 }
 
 /// Entry point of the reader thread: lock the connection, run the query, report the outcome.
-fn read_rows(conn: SharedConn, sql: String, max_rows: usize, abort: CancellationToken, mut reply: Reply, watcher: DropGuard) {
+/// `limits` = (rows, bytes) of one batch.
+fn read_rows(conn: SharedConn, sql: String, limits: (usize, usize), abort: CancellationToken, mut reply: Reply, watcher: DropGuard) {
     let guard = lock_conn(&conn);
     // Declared after `guard` so it is dropped first: the interrupt watcher stops before the
     // connection is released to the next caller.
     let _watcher = watcher;
     let outcome = match guard.as_ref() {
         None => Err(closed()),
-        Some(c) => run_query(c, &sql, max_rows, &abort, &mut reply),
+        Some(c) => run_query(c, &sql, limits, &abort, &mut reply),
     };
     if let Err(e) = outcome {
         reply.fail(e);
@@ -392,7 +398,7 @@ fn read_rows(conn: SharedConn, sql: String, max_rows: usize, abort: Cancellation
 }
 
 /// Prepare, derive the schema, step every row into the batcher and ship batches.
-fn run_query(conn: &rusqlite::Connection, sql: &str, max_rows: usize, abort: &CancellationToken, reply: &mut Reply) -> Result<()> {
+fn run_query(conn: &rusqlite::Connection, sql: &str, (max_rows, max_bytes): (usize, usize), abort: &CancellationToken, reply: &mut Reply) -> Result<()> {
     if abort.is_cancelled() {
         return Err(CoreError::Cancelled);
     }
@@ -425,7 +431,7 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, max_rows: usize, abort: &Ca
     if !reply.schema(schema.clone()) {
         return Ok(());
     }
-    let mut batcher = ArrowBatcher::with_limits(schema, kinds.clone(), max_rows, BATCH_BYTES);
+    let mut batcher = ArrowBatcher::with_limits(schema, kinds.clone(), max_rows, max_bytes);
     let warned = vec![false; kinds.len()];
     let mut codec = RowCodec { kinds, names, warned };
 

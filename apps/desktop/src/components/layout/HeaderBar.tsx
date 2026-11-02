@@ -1,34 +1,28 @@
 'use client';
 
+// LEGACY (deleted in W3): the pre-redesign header. Not mounted any more; kept because the old
+// connection tree imports `StatusDot` from here until the sidebar owner replaces it.
+
 import { Database, Info, Monitor, Moon, Plus, Settings, Sun } from 'lucide-react';
-import { useState } from 'react';
+import type { ComponentType } from 'react';
+import * as AboutModule from '@/components/dialogs/AboutDialog';
 import { getLang, t } from '@/lib/i18n';
 import { inTauri } from '@/lib/ipc';
-import { AboutDialog } from '@/components/dialogs/AboutDialog';
-import { Badge, DropdownMenu, IconButton, Select, Tooltip } from '@/components/ui';
-import { useConnectionsStore, type ConnStatus } from '@/stores/connections';
+import { Badge, DropdownMenu, IconButton, Select, StatusDot } from '@/components/ui';
+import { useConnectionsStore } from '@/stores/connections';
 import { useExtractStore } from '@/stores/extract';
 import { useUiStore, type Theme } from '@/stores/ui';
 
-export const STATUS_DOT: Record<ConnStatus, string> = {
-  unknown: 'bg-muted-foreground/50',
-  testing: 'bg-warning animate-pulse',
-  ok: 'bg-success',
-  error: 'bg-danger',
-};
-
-export function StatusDot({ status, title }: { status: ConnStatus; title?: string }) {
-  return (
-    <Tooltip content={title ?? t(`tree.status.${status}`)}>
-      <span data-status={status} className={`inline-block h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[status]}`} />
-    </Tooltip>
-  );
-}
+/** Moved to `@/components/ui` (DESIGN.md §7.4); re-exported for older imports. */
+export { StatusDot };
 
 const themeIcon: Record<Theme, typeof Sun> = { system: Monitor, light: Sun, dark: Moon };
 
 /** Label of the About button (not in `lib/i18n`, kept with the header). */
 const ABOUT_LABEL = { ko: 'BulkDB 정보', en: 'About BulkDB' } as const;
+
+const AboutDialog = (AboutModule as unknown as Record<string, ComponentType<{ open?: boolean; onOpenChange?: (o: boolean) => void }>>)
+  .AboutDialog;
 
 export function HeaderBar() {
   const connections = useConnectionsStore((s) => s.connections);
@@ -39,7 +33,8 @@ export function HeaderBar() {
   const setTheme = useUiStore((s) => s.setTheme);
   const openConnectionDialog = useUiStore((s) => s.openConnectionDialog);
   const setSettingsOpen = useUiStore((s) => s.setSettingsOpen);
-  const [aboutOpen, setAboutOpen] = useState(false);
+  const aboutOpen = useUiStore((s) => s.aboutOpen);
+  const setAboutOpen = useUiStore((s) => s.setAboutOpen);
   const ThemeIcon = themeIcon[theme];
 
   const onSelect = (id: string) => {
@@ -48,10 +43,10 @@ export function HeaderBar() {
   };
 
   return (
-    <header className="flex h-9 shrink-0 items-center gap-2 border-b border-border bg-muted px-2">
+    <header className="flex h-9 shrink-0 items-center gap-2 border-b border-separator bg-toolbar px-2">
       <div className="flex items-center gap-1.5 pr-2">
         <Database size={16} className="text-accent" />
-        <span className="text-[13px] font-semibold">{t('app.name')}</span>
+        <span className="text-base font-semibold">{t('app.name')}</span>
         {!inTauri() && (
           <Badge tone="warning" title="Running against the in-browser mock backend">
             mock
@@ -93,7 +88,7 @@ export function HeaderBar() {
           <Info size={15} />
         </IconButton>
       </div>
-      <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
+      {AboutDialog && <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />}
     </header>
   );
 }

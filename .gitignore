@@ -149,7 +149,7 @@ vite.config.ts.timestamp-*
 .turbo
 
 # BulkDB
-target/
+/target/
 apps/desktop/out/
 apps/desktop/.next/
 apps/desktop/src-tauri/gen/

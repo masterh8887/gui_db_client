@@ -7,6 +7,12 @@ import type {
   ColumnInfo,
   Connection,
   ConnectionInput,
+  CopyPlan,
+  CopyRequest,
+  CopyResumeRequest,
+  CopyRunDetail,
+  CopyRunInfo,
+  CopyStatus,
   DatabaseInfo,
   DiagnosticsBundle,
   DriverInfo,
@@ -15,6 +21,7 @@ import type {
   HistoryEntry,
   ImportedConnection,
   IndexInfo,
+  InstancesInfo,
   JobSummary,
   LogEvent,
   PlanSummary,
@@ -26,6 +33,8 @@ import type {
   SqlFile,
   TableInfo,
   TableRef,
+  WindowInfo,
+  WindowInit,
 } from 'ipc-types';
 import { invoke } from './ipc';
 
@@ -128,3 +137,36 @@ export const diagnosticsBundle = (outDir: string) =>
 export const appInfo = () => invoke<AppInfo>('app_info');
 /** Reveal a file in the OS file manager, or open a directory. */
 export const openPath = (path: string) => invoke<void>('open_path', { path });
+
+// ---- DB copy (docs/db-copy.md 6.2) ---------------------------------------------------------
+
+/** Plan a copy (no job). `planToken` lets `copyPlanCancel` stop a long plan. */
+export const copyPlan = (req: CopyRequest, planToken?: string) => invoke<CopyPlan>('copy_plan', { req, planToken });
+export const copyPlanCancel = (planToken: string) => invoke<void>('copy_plan_cancel', { planToken });
+/** Start the reviewed plan; `ackKeys` are `AckNeed.key`s. Returns the job id. */
+export const copyStart = (req: CopyRequest, planId: string, ackKeys: string[] = []) =>
+  invoke<string>('copy_start', { req, planId, acknowledgedWarnings: ackKeys });
+export const copyResume = (req: CopyResumeRequest) => invoke<string>('copy_resume', { req });
+export const copyStatus = (jobId: string) => invoke<CopyStatus>('copy_status', { jobId });
+export const copyRuns = (connId?: string, limit?: number) => invoke<CopyRunInfo[]>('copy_runs', { connId, limit });
+export const copyRun = (runId: string) => invoke<CopyRunDetail>('copy_run', { runId });
+export const copyForget = (runId: string) => invoke<void>('copy_forget', { runId });
+
+// ---- windows / instances (docs/db-copy.md 1) -------------------------------------------------
+
+/** Who this window is and the connection it opens with. */
+export const windowInit = () => invoke<WindowInit>('window_init');
+/** Open a new window (Welcome, or `connId`'s workspace); returns its label. */
+export const windowNew = (connId?: string) => invoke<string>('window_new', { connId });
+export const windowList = () => invoke<WindowInfo[]>('window_list');
+export const windowFocus = (label: string) => invoke<void>('window_focus', { label });
+/** Tell the shell which connection this window shows (`null`: Welcome); sets the title. */
+export const windowSetConnection = (connId: string | null) =>
+  invoke<void>('window_set_connection', { connId: connId ?? undefined });
+/** This window started `jobId`: its completion toast shows here. */
+export const windowClaimJob = (jobId: string) => invoke<void>('window_claim_job', { jobId });
+export const instancesInfo = () => invoke<InstancesInfo>('instances_info');
+/** Start another BulkDB process. */
+export const instanceSpawn = () => invoke<void>('instance_spawn');
+/** The user accepted "cancel the running jobs and quit". */
+export const appQuitConfirmed = () => invoke<void>('app_quit_confirmed');

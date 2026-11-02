@@ -195,7 +195,7 @@ pub async fn run_pipeline(stream: SourceStream, sink: Box<dyn Sink>, progress: A
     // writer must not finish the sink in that case: the files would look complete but are not.
     let abnormal = CancellationToken::new();
 
-    let SourceStream { schema, stream } = stream;
+    let SourceStream { schema, stream, .. } = stream;
     let reader = tokio::spawn(reader_task(stream, tx, cancel.clone(), abnormal.clone()));
     let writer = tokio::task::spawn_blocking({
         let progress = progress.clone();
@@ -392,6 +392,8 @@ pub struct JobEntry {
     pub exact_count: Mutex<Option<ExactCount>>,
     /// Resolved by `job_resume` when the job waits in `Warned`.
     pub resume: Mutex<Option<tokio::sync::oneshot::Sender<Vec<String>>>>,
+    /// Copy jobs only (`JobKind::Copy`); `None` for every other kind.
+    pub copy: Option<Arc<crate::copy::CopyJob>>,
 }
 
 impl JobEntry {
@@ -413,6 +415,7 @@ impl JobEntry {
             result: self.result.lock().unwrap().clone(),
             error: self.error.lock().unwrap().clone(),
             exact_count: self.exact_count.lock().unwrap().clone(),
+            copy: self.copy.as_ref().map(|c| c.info()),
         }
     }
 }
@@ -424,6 +427,17 @@ struct JobTable {
     jobs: HashMap<String, Arc<JobEntry>>,
     /// Ids, oldest first.
     order: Vec<String>,
+}
+
+/// Arguments of `JobRegistry::insert`.
+struct NewJob<'a> {
+    id: String,
+    kind: JobKind,
+    conn_id: &'a str,
+    conn_name: &'a str,
+    label: &'a str,
+    request: Option<ExportRequest>,
+    copy: Option<Arc<crate::copy::CopyJob>>,
 }
 
 /// Registry of all jobs of this process plus the event bus.
@@ -444,7 +458,24 @@ impl JobRegistry {
     }
 
     pub fn create(&self, kind: JobKind, conn_id: &str, conn_name: &str, label: &str, request: Option<ExportRequest>) -> Arc<JobEntry> {
-        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let id = Self::new_id();
+        self.insert(NewJob { id, kind, conn_id, conn_name, label, request, copy: None })
+    }
+
+    /// Create a copy job (`JobKind::Copy`; `conn_id` / `conn_name` are the source). `make`
+    /// receives the new job id first, so the first job of a run can use it as the `run_id`.
+    pub fn create_copy(&self, conn_id: &str, conn_name: &str, label: &str, make: impl FnOnce(&str) -> Arc<crate::copy::CopyJob>) -> Arc<JobEntry> {
+        let id = Self::new_id();
+        let copy = make(&id);
+        self.insert(NewJob { id, kind: JobKind::Copy, conn_id, conn_name, label, request: None, copy: Some(copy) })
+    }
+
+    fn new_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+    }
+
+    fn insert(&self, new: NewJob<'_>) -> Arc<JobEntry> {
+        let NewJob { id, kind, conn_id, conn_name, label, request, copy } = new;
         let entry = Arc::new(JobEntry {
             id: id.clone(),
             kind,
@@ -463,6 +494,7 @@ impl JobRegistry {
             error: Mutex::new(None),
             exact_count: Mutex::new(None),
             resume: Mutex::new(None),
+            copy,
         });
         {
             let mut table = self.table.write().unwrap();

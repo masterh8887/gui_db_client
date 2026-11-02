@@ -2,6 +2,7 @@ import type { ConnectionInput, ExportRequest, HostKeyPrompt, JobDone, JobStateEv
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { catalogInvalidate, connGet, connSave, exportPreflight, exportStart, jobCancel, jobResume, queryExplain, sqlCheck } from './commands';
 import { listen } from './ipc';
+import { mockConnections } from './mock-data';
 import { mockBackend } from './mock-ipc';
 
 const FAST = { latencyMs: 0, progressTickMs: 5, prepareMs: 10, runMs: 60, finishingMs: 5, serverIntervalMs: 20, exactCountMs: 20 };
@@ -221,5 +222,38 @@ describe('mock backend', () => {
     const at = '2099-01-01T00:00:00.000Z';
     mockBackend.seedExactCount('c-prod', { table: roles, rows: BigInt(42), elapsedMs: BigInt(1), at });
     expect(await catalogLastExactCount('c-prod', roles)).toMatchObject({ rows: BigInt(42), at });
+  });
+
+  it('conn_save keeps the environment tag, clears it when omitted, and duplicates with id ""', async () => {
+    const { connList } = await import('./commands');
+    const { connTag } = await import('./env');
+    const tags = Object.fromEntries((await connList()).map((c) => [c.id, connTag(c)]));
+    expect(tags).toEqual({ 'c-prod': 'production', 'c-local': 'local', 'c-staging': 'staging', 'c-legacy': 'testing', 'c-mysql8': 'development' });
+
+    const prod = await connGet('c-prod');
+    const retagged = await connSave({ ...prod, tag: 'testing' } as ConnectionInput);
+    expect(connTag(retagged)).toBe('testing');
+    const { tag: _drop, ...untagged } = retagged as typeof retagged & { tag?: string };
+    expect(_drop).toBe('testing');
+    const cleared = await connSave(untagged as ConnectionInput);
+    expect(connTag(cleared)).toBeUndefined();
+    expect('tag' in cleared).toBe(false);
+
+    const copy = await connSave({ ...prod, id: '', name: 'prod copy', tag: 'production' } as ConnectionInput);
+    expect(copy.id).not.toBe('c-prod');
+    expect(connTag(copy)).toBe('production');
+    expect((await connList()).map((c) => c.id)).toContain(copy.id);
+  });
+
+  it('conn_save write access, like core: never on a new connection, kept on an edit, cleared when the endpoint moves', async () => {
+    const base = mockConnections().find((c) => c.id === 'c-staging')!;
+    const created = await connSave({ ...base, id: '', name: 'new target', writeAllowed: true });
+    expect(created.writeAllowed).toBeUndefined();
+    const allowed = await connSave({ ...base, writeAllowed: true });
+    expect(allowed.writeAllowed).toBe(true);
+    const kept = await connSave({ ...allowed, writeAllowed: undefined, name: 'renamed' });
+    expect(kept.writeAllowed).toBe(true);
+    const moved = await connSave({ ...kept, writeAllowed: undefined, host: 'elsewhere.example' });
+    expect(moved.writeAllowed).toBeUndefined();
   });
 });

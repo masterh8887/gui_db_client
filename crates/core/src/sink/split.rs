@@ -96,6 +96,8 @@ pub struct SplitSink {
     reported_bytes: u64,
     /// Completed files, under their final names.
     files: Vec<PathBuf>,
+    /// Characters written as `?` by the completed files (EUC-KR CSV), summed over parts.
+    unmappable: u64,
     /// Files whose sink failed while opening or closing, already renamed to `.partial`.
     failed: Vec<PathBuf>,
 }
@@ -120,6 +122,7 @@ impl SplitSink {
             done_bytes: 0,
             reported_bytes: 0,
             files: Vec::new(),
+            unmappable: 0,
             failed: Vec::new(),
         }
     }
@@ -181,6 +184,7 @@ impl SplitSink {
             match sink.finish() {
                 Ok(rep) => {
                     self.done_bytes += rep.bytes;
+                    self.unmappable += rep.unmappable_chars;
                     self.files.extend(rep.files);
                 }
                 Err(e) => {
@@ -339,7 +343,7 @@ impl Sink for SplitSink {
             self.abort_all();
             return Err(e);
         }
-        Ok(SinkReport { rows: self.rows, bytes: self.done_bytes, files: std::mem::take(&mut self.files) })
+        Ok(SinkReport { rows: self.rows, bytes: self.done_bytes, files: std::mem::take(&mut self.files), unmappable_chars: self.unmappable })
     }
 
     fn abort(mut self: Box<Self>) -> Vec<PathBuf> {

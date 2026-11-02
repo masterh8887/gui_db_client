@@ -2,7 +2,7 @@
 
 import { useState, type InputHTMLAttributes } from 'react';
 import { cn } from '@/lib/utils';
-import { inputClasses } from './Input';
+import { hasWidthClass, inputClasses } from './Input';
 
 export interface NumberInputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'type'> {
   value: number | undefined;
@@ -58,7 +58,7 @@ export function NumberInput({
     <input
       type="number"
       inputMode={integer ? 'numeric' : 'decimal'}
-      className={cn(inputClasses({ invalid: invalid || bad }), 'tabular-nums', className)}
+      className={cn(inputClasses({ invalid: invalid || bad, fullWidth: !hasWidthClass(className) }), 'tabular-nums', className)}
       value={text}
       min={min}
       max={max}

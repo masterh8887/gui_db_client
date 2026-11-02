@@ -1,5 +1,5 @@
-//! tracing setup: daily log files in `<config>/logs`, an in-memory ring buffer for the UI log
-//! panel, and a masking layer so passwords never reach any output. `mask_secrets` is unit
+//! tracing setup: daily log files per process (`bulkdb-<pid>.<date>.log`) in `<config>/logs`,
+//! an in-memory ring buffer for the UI log panel, and a masking layer so passwords never reach any output. `mask_secrets` is unit
 //! tested against `password=`, `PGPASSWORD`, DSN passwords and `Authorization` headers.
 //!
 //! Masking happens twice on purpose: [`RingLayer`] masks the message it hands to the UI, and
@@ -330,15 +330,57 @@ fn env_filter(level: &str) -> EnvFilter {
 /// Install the global subscriber. Returns a guard that must be kept alive for the file
 /// appender to flush. Safe to call once per process; later calls are no-ops.
 ///
+/// Log files are kept this long (by modification time); `init` deletes older ones.
+pub const LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// File name prefix of this process's log files: one file per process and day,
+/// `bulkdb-<pid>.<yyyy-mm-dd>.log`, so several BulkDB processes never write into one file
+/// (docs/db-copy.md 1.2).
+pub fn log_file_prefix(pid: u32) -> String {
+    format!("bulkdb-{pid}")
+}
+
+/// A BulkDB log file of any process or version: `bulkdb-<pid>.<date>.log`, the older
+/// `bulkdb.log.<date>`, or anything else `bulkdb*.log`.
+pub fn is_log_file_name(name: &str) -> bool {
+    name.starts_with("bulkdb") && (name.ends_with(".log") || name.starts_with("bulkdb.log."))
+}
+
+/// Delete BulkDB log files in `dir` last modified more than [`LOG_RETENTION`] before `now`.
+/// Returns how many were removed. Files of other processes are judged by the same age rule
+/// (a live process writes its file at least daily).
+pub fn prune_old_logs(dir: &Path, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_log_file_name(&name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta.is_file() && meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age > LOG_RETENTION);
+        if old && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Layers: `EnvFilter` (from `RUST_LOG` or `level`), a `fmt` layer writing daily rolling
-/// `bulkdb.log.<date>` files in `log_dir` through a non-blocking, line-masking writer, and
-/// [`RingLayer`] feeding `buffer` for the UI.
+/// `bulkdb-<pid>.<date>.log` files in `log_dir` through a non-blocking, line-masking writer,
+/// and [`RingLayer`] feeding `buffer` for the UI. Log files older than 14 days are deleted.
 pub fn init(log_dir: &Path, level: &str, buffer: Arc<LogBuffer>) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
     if INIT.set(()).is_err() {
         return Ok(None);
     }
     std::fs::create_dir_all(log_dir)?;
-    let appender = tracing_appender::rolling::daily(log_dir, "bulkdb.log");
+    prune_old_logs(log_dir, std::time::SystemTime::now());
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(log_file_prefix(std::process::id()))
+        .filename_suffix("log")
+        .build(log_dir)
+        .map_err(|e| crate::error::CoreError::Io(format!("log file: {e}")))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
     let file_layer = tracing_subscriber::fmt::layer().with_ansi(false).with_target(true).with_writer(MaskingMakeWriter(non_blocking));
     let subscriber = Registry::default().with(env_filter(level)).with(file_layer).with(RingLayer::new(buffer));
@@ -460,5 +502,50 @@ mod tests {
         let _ = env_filter("debug");
         let _ = env_filter("");
         let _ = env_filter("bulk_core=trace,info");
+    }
+
+    /// One file per process and day: `bulkdb-<pid>.<yyyy-mm-dd>.log` (the builder `init` uses).
+    #[test]
+    fn log_files_are_named_per_process() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = log_file_prefix(4242);
+        assert_eq!(prefix, "bulkdb-4242");
+        let mut appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(prefix)
+            .filename_suffix("log")
+            .build(dir.path())
+            .unwrap();
+        appender.write_all(b"line\n").unwrap();
+        appender.flush().unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let re = Regex::new(r"^bulkdb-4242\.\d{4}-\d{2}-\d{2}\.log$").unwrap();
+        assert!(re.is_match(&names[0]), "{}", names[0]);
+        assert!(is_log_file_name(&names[0]));
+    }
+
+    #[test]
+    fn prune_removes_only_old_bulkdb_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let file = |name: &str, age_days: u32| {
+            let path = dir.path().join(name);
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_modified(now - day * age_days).unwrap();
+        };
+        file("bulkdb-10.2026-01-01.log", 20); // old, this naming
+        file("bulkdb.log.2026-01-01", 30); // old, the naming before per-process files
+        file("bulkdb-11.2026-10-20.log", 13); // recent
+        file("bulkdb-12.2026-10-27.log", 0); // today (another live process)
+        file("notes.log", 40); // not ours
+        file("bulkdb-config.toml", 40); // not a log
+        assert_eq!(prune_old_logs(dir.path(), now), 2);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["bulkdb-11.2026-10-20.log", "bulkdb-12.2026-10-27.log", "bulkdb-config.toml", "notes.log"]);
+        assert_eq!(prune_old_logs(&dir.path().join("missing"), now), 0);
     }
 }

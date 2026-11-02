@@ -1,28 +1,41 @@
 //! Tauri shell. Rules: no business logic here; `commands.rs` functions convert arguments to
 //! core types, call `bulk_core::BulkDb` and return; `events.rs` forwards core events and emits
-//! progress every 200 ms; `state.rs` owns the managed `Arc<BulkDb>` and the IPC error type.
+//! progress every 200 ms; `state.rs` owns the managed `Arc<BulkDb>` and the IPC error type;
+//! `menu.rs` builds the macOS menu bar and forwards its items as `menu:action` to the focused
+//! window; `windows.rs` keeps the registry of this process's windows (docs/db-copy.md 1.1).
 
 mod commands;
 mod events;
+mod menu;
 mod state;
+mod windows;
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use tauri::{Manager, RunEvent, WindowEvent};
-
-/// Label of the single window declared in `tauri.conf.json`.
-const MAIN_WINDOW: &str = "main";
+use tauri::{Manager, RunEvent};
 
 pub fn run() {
     let started = Instant::now();
     let app = tauri::Builder::default()
+        // macOS: menu.rs installs the app's own menu bar; Tauri's default one would put Close
+        // Window on ⌘W (quitting instead of closing a tab) and none of the app's key equivalents.
+        .enable_macos_default_menu(false)
+        .on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()))
+        // Managed before the first window exists, so its focus events find the registry.
+        .manage(windows::WindowRegistry::default())
+        .on_window_event(windows::on_window_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let db = state::init(started)?;
             app.manage(Arc::clone(&db));
             events::spawn(app.handle().clone(), db);
+            // Korean = the UI's default language; the frontend relabels via `menu_set_language`.
+            // Not fatal: buttons and the palette still reach every action without the menu.
+            if let Err(e) = menu::install(app.handle(), menu::Lang::Ko) {
+                tracing::error!(error = %e, "desktop shell: macOS menu bar not installed");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -62,6 +75,27 @@ pub fn run() {
             commands::diagnostics_bundle,
             commands::app_info,
             commands::open_path,
+            commands::menu_set_language,
+            commands::copy_plan,
+            commands::copy_plan_cancel,
+            commands::copy_start,
+            commands::copy_resume,
+            commands::copy_status,
+            commands::copy_runs,
+            commands::copy_run,
+            commands::copy_forget,
+            commands::window_init,
+            commands::window_new,
+            commands::window_list,
+            commands::window_focus,
+            commands::window_set_connection,
+            commands::window_claim_job,
+            commands::window_ready,
+            commands::window_close_begin,
+            commands::window_close_cancel,
+            commands::instances_info,
+            commands::instance_spawn,
+            commands::app_quit_confirmed,
         ])
         .build(tauri::generate_context!())
         .expect("error while building BulkDB");
@@ -71,9 +105,10 @@ pub fn run() {
         RunEvent::Ready => {
             tracing::info!(startup_ms = started.elapsed().as_millis() as u64, "desktop shell: ready");
         }
-        // Either path ends the session: kill tunnels and cancel jobs before the process goes.
-        RunEvent::ExitRequested { .. } => state::shutdown(handle),
-        RunEvent::WindowEvent { label, event: WindowEvent::Destroyed, .. } if label == MAIN_WINDOW => state::shutdown(handle),
+        // Cmd+Q, the menu's Quit or the OS while jobs run: the focused window asks first
+        // (`app:quit-requested`); `app_quit_confirmed` exits for real. Every other exit ends the
+        // session here (the last window's `Destroyed` does too, in `windows.rs`).
+        RunEvent::ExitRequested { code, api, .. } if windows::hold_exit(handle, code) => api.prevent_exit(),
         _ => {}
     });
 }
@@ -95,6 +130,25 @@ mod tests {
         let urls: Vec<&str> = scoped["allow"].as_array().expect("allow list").iter().filter_map(|e| e["url"].as_str()).collect();
         assert_eq!(urls, ["https://*"], "install links are https; nothing broader is granted");
         assert!(scoped.get("deny").is_none_or(|d| d.as_array().is_some_and(|d| d.is_empty())));
+    }
+
+    /// Every window gets the app's permissions (docs/db-copy.md 1.1): `main` and the `w-<n>`
+    /// windows `window_new` opens; without the glob a second window could not call a command.
+    /// Focusing and closing windows from the page needs the three window permissions.
+    #[test]
+    fn capability_covers_every_window() {
+        let cap: serde_json::Value = serde_json::from_str(DEFAULT_CAPABILITY).expect("capability JSON parses");
+        let windows: Vec<&str> = cap["windows"].as_array().expect("windows array").iter().filter_map(|w| w.as_str()).collect();
+        assert_eq!(windows, ["main", "w-*"]);
+        let perms: Vec<&str> = cap["permissions"].as_array().expect("permissions array").iter().filter_map(|p| p.as_str()).collect();
+        for p in ["core:window:allow-set-focus", "core:window:allow-close", "core:window:allow-destroy", "core:window:allow-set-title"] {
+            assert!(perms.contains(&p), "missing {p}");
+        }
+        // Labels the registry hands out match the glob.
+        let mut reg = crate::windows::RegistryState::with_main();
+        let (label, _) = reg.reserve(None).unwrap();
+        assert!(label.starts_with("w-"), "{label}");
+        assert_eq!(crate::windows::MAIN_WINDOW, "main");
     }
 
     /// The app config, exactly as `tauri-build` / `generate_context!` read it.

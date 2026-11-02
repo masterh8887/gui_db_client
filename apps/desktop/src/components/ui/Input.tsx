@@ -4,24 +4,35 @@ import { forwardRef, type InputHTMLAttributes, type ReactNode, type TextareaHTML
 import { cn } from '@/lib/utils';
 
 const inputBase =
-  'w-full min-w-0 rounded border bg-background px-2 text-foreground placeholder:text-muted-foreground/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 read-only:bg-muted';
+  'input-focus min-w-0 rounded-md border bg-input px-2 text-fg placeholder:text-fg-tertiary disabled:pointer-events-none disabled:opacity-50 read-only:bg-control';
 
 /**
- * Classes for text-like controls. `cn` does not resolve Tailwind conflicts (no tailwind-merge),
- * so size and state are chosen here instead of being overridden through `className`.
+ * True when the caller's classes set a width (`w-24`, `w-[76px]`). Without tailwind-merge two
+ * width utilities race on CSS order (`w-full` won), so controls drop their default `w-full`.
  */
-export function inputClasses({ dense = false, invalid = false, multiline = false } = {}): string {
+export function hasWidthClass(className: string | undefined): boolean {
+  return !!className && /(^|\s)w-/.test(className);
+}
+
+/**
+ * Classes for text-like controls: 26px (`dense` 22px), `--bg-input`, 1px `--border-input`,
+ * radius 6, accent border + 3px ring on focus (DESIGN.md §3.3). `cn` does not resolve Tailwind
+ * conflicts (no tailwind-merge), so size and state are chosen here, not overridden by callers;
+ * the width is the exception (`fullWidth: false` when the caller sets one, see hasWidthClass).
+ */
+export function inputClasses({ dense = false, invalid = false, multiline = false, fullWidth = true } = {}): string {
   return cn(
     inputBase,
-    multiline ? 'py-1 leading-5' : dense ? 'h-6' : 'h-7',
-    dense ? 'text-xs' : 'text-[13px]',
-    invalid ? 'border-danger focus:border-danger' : 'border-border focus:border-accent',
+    fullWidth && 'w-full',
+    multiline ? 'py-1 leading-5' : dense ? 'h-(--h-control-sm)' : 'h-(--h-control)',
+    dense ? 'text-sm' : 'text-base',
+    invalid ? 'border-danger' : 'border-border-input',
   );
 }
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   invalid?: boolean;
-  /** 24px tall, 12px text (toolbars). */
+  /** 22px tall, 12px text (bars). */
   dense?: boolean;
 }
 
@@ -29,7 +40,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input({ c
   return (
     <input
       ref={ref}
-      className={cn(inputClasses({ dense, invalid }), className)}
+      className={cn(inputClasses({ dense, invalid, fullWidth: !hasWidthClass(className) }), className)}
       aria-invalid={invalid || undefined}
       spellCheck={false}
       autoComplete="off"
@@ -46,7 +57,7 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(function 
   return (
     <textarea
       ref={ref}
-      className={cn(inputClasses({ invalid, multiline: true }), className)}
+      className={cn(inputClasses({ invalid, multiline: true, fullWidth: !hasWidthClass(className) }), className)}
       aria-invalid={invalid || undefined}
       spellCheck={false}
       {...rest}
@@ -70,28 +81,28 @@ export function Field({
   error?: ReactNode;
   className?: string;
   children: ReactNode;
-  /** Label on the left (checkbox / switch rows). */
+  /** Label on the right of the control (checkbox / switch rows). */
   inline?: boolean;
 }) {
   if (inline) {
     return (
-      <label htmlFor={htmlFor} className={cn('flex h-7 cursor-pointer items-center gap-2 text-[13px]', className)}>
+      <label htmlFor={htmlFor} className={cn('flex min-h-(--h-control) items-center gap-2 text-base', className)}>
         {children}
         <span>{label}</span>
-        {hint && <span className="text-xs text-muted-foreground">{hint}</span>}
+        {hint && <span className="text-sm text-fg-secondary">{hint}</span>}
       </label>
     );
   }
   return (
     <div className={cn('flex flex-col gap-1', className)}>
-      <label htmlFor={htmlFor} className="text-xs font-medium text-muted-foreground">
+      <label htmlFor={htmlFor} className="text-sm font-medium text-fg-secondary">
         {label}
       </label>
       {children}
       {error ? (
-        <span className="text-xs text-danger">{error}</span>
+        <span className="text-sm text-danger">{error}</span>
       ) : hint ? (
-        <span className="text-xs text-muted-foreground">{hint}</span>
+        <span className="text-sm text-fg-secondary">{hint}</span>
       ) : null}
     </div>
   );

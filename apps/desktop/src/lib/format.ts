@@ -158,3 +158,14 @@ export function joinPath(dir: string, file: string): string {
   const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/';
   return dir.endsWith(sep) ? `${dir}${file}` : `${dir}${sep}${file}`;
 }
+
+/** Clock-style duration from seconds: `0:07`, `3:12`, `1:02:03`; unknown -> `—`. */
+export function formatClock(sec: Num): string {
+  const n = num(sec);
+  if (n === undefined || !Number.isFinite(n) || n < 0) return '—';
+  const total = Math.round(n);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`;
+}

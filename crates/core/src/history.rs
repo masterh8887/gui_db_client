@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rusqlite::{params, OptionalExtension};
 
@@ -63,12 +64,46 @@ fn state_from_str(s: &str) -> JobState {
     serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(JobState::Failed)
 }
 
+/// How long a statement waits for another connection's write lock (another BulkDB process, or
+/// the copy checkpoint store) before failing with `SQLITE_BUSY` (docs/db-copy.md 1.2).
+pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Open `history.sqlite` the way every BulkDB connection to it must: `busy_timeout` first (so
+/// even switching to WAL waits for a writer in another process), then WAL. Used by
+/// [`History::open`]; the copy checkpoint store opens its own connection the same way.
+pub fn open_shared(path: &Path) -> Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    retry_busy(|| conn.execute_batch("PRAGMA journal_mode=WAL;"))?;
+    Ok(conn)
+}
+
+/// Run `f` again while SQLite answers `SQLITE_BUSY` / `SQLITE_LOCKED` without having waited
+/// (it skips the busy handler where waiting could deadlock: switching to WAL, upgrading a read
+/// to a write), for up to [`BUSY_TIMEOUT`]. For the one-off setup statements of a connection.
+pub fn retry_busy<T>(mut f: impl FnMut() -> rusqlite::Result<T>) -> Result<T> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match f() {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other.map_err(Into::into),
+        }
+    }
+}
+
 impl History {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS runs (
+        let conn = open_shared(path)?;
+        retry_busy(|| conn.execute_batch(SCHEMA))?;
+        Ok(History { conn: Mutex::new(conn) })
+    }
+}
+
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS runs (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                job_id TEXT NOT NULL UNIQUE,
                conn_id TEXT NOT NULL,
@@ -94,11 +129,9 @@ impl History {
                elapsed_ms INTEGER NOT NULL,
                at TEXT NOT NULL,
                PRIMARY KEY (conn_id, table_key)
-             );",
-        )?;
-        Ok(History { conn: Mutex::new(conn) })
-    }
+             );";
 
+impl History {
     pub fn in_memory() -> Result<Self> {
         Self::open(Path::new(":memory:"))
     }
@@ -372,5 +405,59 @@ mod tests {
         }
         let h = History::open(&path).unwrap();
         assert_eq!(h.count(None).unwrap(), 1);
+    }
+
+    /// Every connection waits up to 5 s for a writer elsewhere (docs/db-copy.md 1.2).
+    #[test]
+    fn connections_wait_for_other_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite");
+        let h = History::open(&path).unwrap();
+        let ms: i64 = h.lock().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert_eq!(ms, 5000);
+        let mode: String = h.lock().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+
+        // Another process holds the write lock for a moment: the insert waits instead of
+        // failing with SQLITE_BUSY.
+        let other = open_shared(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE; INSERT INTO exact_counts (conn_id, table_key, rows, elapsed_ms, at) VALUES ('x', 't', 1, 1, 'now');").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        let t = std::time::Instant::now();
+        h.record_start(start("j", "c", &SessionOpts::default(), &OutputOpts::default())).unwrap();
+        assert!(t.elapsed() >= std::time::Duration::from_millis(250), "{:?}", t.elapsed());
+        release.join().unwrap();
+        assert_eq!(h.count(None).unwrap(), 1);
+    }
+
+    /// Two processes (two `History` handles on one file) writing at the same time lose nothing.
+    #[test]
+    fn two_handles_write_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.sqlite");
+        let writers: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|who| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let h = History::open(&path).unwrap();
+                    let (session, output) = (SessionOpts::default(), OutputOpts::default());
+                    for i in 0..40 {
+                        let job = format!("{who}{i}");
+                        h.record_start(start(&job, who, &session, &output)).unwrap();
+                        h.record_finish(&job, JobState::Done, None, None).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let h = History::open(&path).unwrap();
+        assert_eq!(h.count(Some("a")).unwrap(), 40);
+        assert_eq!(h.count(Some("b")).unwrap(), 40);
     }
 }

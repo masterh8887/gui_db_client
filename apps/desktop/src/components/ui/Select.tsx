@@ -1,12 +1,20 @@
 'use client';
 
 import * as RadixSelect from '@radix-ui/react-select';
-import { Check, ChevronDown } from 'lucide-react';
+import { Check, ChevronsUpDown } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { cn } from '@/lib/utils';
+import { hasWidthClass } from './Input';
 
 export interface SelectOption<V extends string = string> {
   value: V;
+  /** Plain text: typeahead, and what shows when `content` is not given. */
   label: string;
+  /**
+   * Rich row (e.g. a driver badge, the name and an EnvTag). Radix mirrors the chosen option's
+   * content into the trigger, so the closed control shows it too.
+   */
+  content?: ReactNode;
   disabled?: boolean;
 }
 
@@ -19,11 +27,19 @@ export interface SelectProps<V extends string = string> {
   className?: string;
   id?: string;
   'aria-label'?: string;
+  /** sm 22px, md 26px. */
   size?: 'sm' | 'md';
+  /** As Radix: runs when the popup closes; `preventDefault()` keeps focus off the trigger. */
+  onCloseAutoFocus?: (event: Event) => void;
 }
 
+export const selectContentClass =
+  'animate-enter z-50 max-h-[min(360px,var(--radix-select-content-available-height))] min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded-[8px] bg-elevated p-1 text-base text-fg shadow-popover';
+export const selectItemClass =
+  'relative flex h-(--h-row-sm) select-none items-center rounded-[5px] pl-6 pr-2 outline-none data-[disabled]:opacity-45 data-[highlighted]:bg-selected-focus data-[highlighted]:text-on-accent';
+
 /**
- * Radix select styled as a dense 28px control. Always controlled: `undefined` is passed to
+ * Radix select styled as a native popup button. Always controlled: `undefined` is passed to
  * Radix as `''`, which shows the placeholder (so the control never flips from uncontrolled to
  * controlled when a value arrives later).
  */
@@ -36,6 +52,7 @@ export function Select<V extends string = string>({
   className,
   id,
   size = 'md',
+  onCloseAutoFocus,
   ...aria
 }: SelectProps<V>) {
   return (
@@ -44,36 +61,28 @@ export function Select<V extends string = string>({
         id={id}
         aria-label={aria['aria-label']}
         className={cn(
-          'inline-flex w-full min-w-0 items-center justify-between gap-1 rounded border border-border bg-background px-2 text-left text-[13px] text-foreground data-[placeholder]:text-muted-foreground focus:border-accent focus:outline-none disabled:cursor-not-allowed disabled:opacity-50',
-          size === 'sm' ? 'h-6 text-xs' : 'h-7',
+          'input-focus inline-flex min-w-0 items-center justify-between gap-1 rounded-md border border-border-input bg-input px-2 text-left text-fg data-[placeholder]:text-fg-tertiary disabled:pointer-events-none disabled:opacity-50',
+          !hasWidthClass(className) && 'w-full',
+          size === 'sm' ? 'h-(--h-control-sm) text-sm' : 'h-(--h-control) text-base',
           className,
         )}
       >
-        <span className="truncate">
+        <span className="min-w-0 truncate">
           <RadixSelect.Value placeholder={placeholder} />
         </span>
         <RadixSelect.Icon>
-          <ChevronDown size={14} className="shrink-0 text-muted-foreground" />
+          <ChevronsUpDown size={12} strokeWidth={1.75} className="shrink-0 text-fg-secondary" />
         </RadixSelect.Icon>
       </RadixSelect.Trigger>
       <RadixSelect.Portal>
-        <RadixSelect.Content
-          position="popper"
-          sideOffset={2}
-          className="z-50 min-w-[var(--radix-select-trigger-width)] overflow-hidden rounded border border-border bg-background shadow-lg"
-        >
-          <RadixSelect.Viewport className="p-1">
+        <RadixSelect.Content position="popper" sideOffset={4} className={selectContentClass} onCloseAutoFocus={onCloseAutoFocus}>
+          <RadixSelect.Viewport>
             {options.map((o) => (
-              <RadixSelect.Item
-                key={o.value}
-                value={o.value}
-                disabled={o.disabled}
-                className="relative flex h-7 cursor-default select-none items-center rounded pl-6 pr-2 text-[13px] outline-none data-[disabled]:opacity-50 data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground"
-              >
+              <RadixSelect.Item key={o.value} value={o.value} disabled={o.disabled} textValue={o.label} className={selectItemClass}>
                 <RadixSelect.ItemIndicator className="absolute left-1.5 inline-flex items-center">
-                  <Check size={12} />
+                  <Check size={12} strokeWidth={2} />
                 </RadixSelect.ItemIndicator>
-                <RadixSelect.ItemText>{o.label}</RadixSelect.ItemText>
+                <RadixSelect.ItemText>{o.content ?? o.label}</RadixSelect.ItemText>
               </RadixSelect.Item>
             ))}
           </RadixSelect.Viewport>

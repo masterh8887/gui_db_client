@@ -46,10 +46,34 @@
 //! | diagnostics_bundle      | outDir                                         | DiagnosticsBundle     |
 //! | app_info                | —                                              | AppInfo               |
 //! | open_path               | path (file: reveal in folder; dir: open it)    | null                  |
+//! | menu_set_language       | lang: "ko" or "en" (macOS menu labels)         | null                  |
+//! | copy_plan               | req: CopyRequest, planToken?                   | CopyPlan              |
+//! | copy_plan_cancel        | planToken                                      | null                  |
+//! | copy_start              | req: CopyRequest, planId, acknowledgedWarnings: string[] (ack keys) | string (jobId) |
+//! | copy_resume             | req: CopyResumeRequest                         | string (jobId)        |
+//! | copy_status             | jobId                                          | CopyStatus            |
+//! | copy_runs               | connId?, limit? (default 50)                   | CopyRunInfo[]         |
+//! | copy_run                | runId                                          | CopyRunDetail         |
+//! | copy_forget             | runId                                          | null                  |
+//! | window_init             | — (the calling window)                         | WindowInit            |
+//! | window_new              | connId?                                        | string (label)        |
+//! | window_list             | —                                              | WindowInfo[]          |
+//! | window_focus            | label                                          | null                  |
+//! | window_set_connection   | connId? (the calling window)                   | null                  |
+//! | window_claim_job        | jobId (the calling window)                     | null                  |
+//! | window_ready            | — (the calling window listens now)             | null                  |
+//! | window_close_begin      | — (the calling window is closing)              | { last, jobs }        |
+//! | window_close_cancel     | — (the calling window stays open)              | null                  |
+//! | instances_info          | —                                              | InstancesInfo         |
+//! | instance_spawn          | —                                              | null                  |
+//! | app_quit_confirmed      | —                                              | null                  |
 //!
 //! Events emitted by the shell are documented in `events.rs`:
 //! `job:progress`, `job:server`, `job:state`, `job:done`, `job:log`, `tunnel:hostkey`,
-//! `tunnel:password`, `drivers:changed`.
+//! `tunnel:password`, `drivers:changed`, `copy:progress`, `connections:changed`,
+//! `settings:changed`, `prompt:resolved`, `windows:changed`; `menu.rs` emits `menu:action`
+//! (macOS menu bar items). Window-targeted (docs/db-copy.md 1.1): `menu:action`,
+//! `tunnel:hostkey`, `tunnel:password`, `jobs:claimed`, `app:quit-requested`.
 //!
 //! Errors: every command rejects with `ErrorPayload` whose `code` is one of
 //! `CONNECT, AUTH, QUERY, IO, CANCELLED, TIMEOUT, DRIVER_MISSING, OOM_RISK, INVALID, TUNNEL,
@@ -61,15 +85,19 @@ use std::sync::Arc;
 use bulk_core::sqlguard::SqlCheck;
 use bulk_core::types::*;
 use bulk_core::BulkDb;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_opener::OpenerExt;
 
+use crate::menu;
 use crate::state::{blocking, CmdError, CmdResult};
+use crate::windows::{self, WindowRegistry};
 
 /// Default page size for `history_list`.
 const DEFAULT_HISTORY_LIMIT: usize = 200;
 /// Default number of lines for `logs_recent`.
 const DEFAULT_LOG_LIMIT: usize = 500;
+/// Default page size for `copy_runs`.
+const DEFAULT_COPY_RUNS_LIMIT: usize = 50;
 
 // ---------------------------------------------------------------------------------------- drivers
 
@@ -287,6 +315,142 @@ pub async fn open_path(app: AppHandle, path: String) -> CmdResult<()> {
     result.map_err(|e| CmdError::io(format!("open path: {e}")))
 }
 
+/// Relabel the macOS menu bar in the UI language. A no-op on Windows (no menu bar).
+#[tauri::command]
+pub async fn menu_set_language(app: AppHandle, lang: String) -> CmdResult<()> {
+    let parsed = menu::Lang::parse(&lang).ok_or_else(|| CmdError::new("INVALID", format!("unknown UI language: {lang}"), None))?;
+    Ok(menu::install(&app, parsed)?)
+}
+
+// --------------------------------------------------------------------------------------- DB copy
+
+/// Plan a copy (no job). `planToken` lets `copy_plan_cancel` stop it.
+#[tauri::command]
+pub async fn copy_plan(svc: State<'_, Arc<BulkDb>>, req: CopyRequest, plan_token: Option<String>) -> CmdResult<CopyPlan> {
+    Ok(svc.copy_plan(&req, plan_token).await?)
+}
+
+#[tauri::command]
+pub async fn copy_plan_cancel(svc: State<'_, Arc<BulkDb>>, plan_token: String) -> CmdResult<()> {
+    Ok(svc.copy_plan_cancel(&plan_token)?)
+}
+
+/// Start a copy bound to the reviewed plan; `acknowledgedWarnings` are `AckNeed.key`s.
+#[tauri::command]
+pub async fn copy_start(svc: State<'_, Arc<BulkDb>>, req: CopyRequest, plan_id: String, acknowledged_warnings: Vec<String>) -> CmdResult<String> {
+    Ok(svc.copy_start(req, plan_id, acknowledged_warnings).await?)
+}
+
+#[tauri::command]
+pub async fn copy_resume(svc: State<'_, Arc<BulkDb>>, req: CopyResumeRequest) -> CmdResult<String> {
+    Ok(svc.copy_resume(req).await?)
+}
+
+#[tauri::command]
+pub async fn copy_status(svc: State<'_, Arc<BulkDb>>, job_id: String) -> CmdResult<CopyStatus> {
+    Ok(svc.copy_status(&job_id)?)
+}
+
+#[tauri::command]
+pub async fn copy_runs(svc: State<'_, Arc<BulkDb>>, conn_id: Option<String>, limit: Option<usize>) -> CmdResult<Vec<CopyRunInfo>> {
+    let limit = limit.unwrap_or(DEFAULT_COPY_RUNS_LIMIT);
+    blocking(&svc, move |db| db.copy_runs(conn_id.as_deref(), limit)).await
+}
+
+#[tauri::command]
+pub async fn copy_run(svc: State<'_, Arc<BulkDb>>, run_id: String) -> CmdResult<CopyRunDetail> {
+    blocking(&svc, move |db| db.copy_run(&run_id)).await
+}
+
+#[tauri::command]
+pub async fn copy_forget(svc: State<'_, Arc<BulkDb>>, run_id: String) -> CmdResult<()> {
+    blocking(&svc, move |db| db.copy_forget(&run_id)).await
+}
+
+// ------------------------------------------------------------------------- windows / instances
+// Several windows (docs/db-copy.md 1.1; registry in `windows.rs`) and several processes (1.2).
+
+/// Who the calling window is (label, display index) and the connection it was opened for.
+#[tauri::command]
+pub async fn window_init(window: WebviewWindow, reg: State<'_, WindowRegistry>) -> CmdResult<WindowInit> {
+    Ok(reg.with(|s| s.init(window.label())))
+}
+
+/// Open a window on Welcome, or on `connId`'s workspace; returns its label. At most 8.
+/// Async: creating a window from a synchronous command deadlocks on Windows.
+#[tauri::command]
+pub async fn window_new(app: AppHandle, svc: State<'_, Arc<BulkDb>>, conn_id: Option<String>) -> CmdResult<String> {
+    if let Some(id) = conn_id.as_deref() {
+        svc.conn_get(id)?;
+    }
+    windows::create_window(&app, conn_id).await
+}
+
+#[tauri::command]
+pub async fn window_list(reg: State<'_, WindowRegistry>) -> CmdResult<Vec<WindowInfo>> {
+    Ok(reg.with(|s| s.infos()))
+}
+
+#[tauri::command]
+pub async fn window_focus(app: AppHandle, label: String) -> CmdResult<()> {
+    windows::focus_window(&app, &label)
+}
+
+/// The calling window now shows `connId`'s workspace (absent: Welcome); sets its title.
+#[tauri::command]
+pub async fn window_set_connection(app: AppHandle, window: WebviewWindow, svc: State<'_, Arc<BulkDb>>, conn_id: Option<String>) -> CmdResult<()> {
+    let conn = conn_id.and_then(|id| svc.config.get(&id)).map(|c| (c.id, c.name));
+    windows::set_connection(&app, window.label(), conn)
+}
+
+/// The calling window started `jobId`: its completion toast shows there (handed to another
+/// window if this one closes first).
+#[tauri::command]
+pub async fn window_claim_job(window: WebviewWindow, reg: State<'_, WindowRegistry>, job_id: String) -> CmdResult<()> {
+    reg.with(|s| s.claim_job(window.label(), &job_id));
+    Ok(())
+}
+
+/// The calling window's page listens to its window-targeted events now; it is sent again what
+/// it may have missed while loading (pending tunnel prompts, job claims, the quit question).
+#[tauri::command]
+pub async fn window_ready(app: AppHandle, window: WebviewWindow) -> CmdResult<()> {
+    windows::window_ready(&app, window.label());
+    Ok(())
+}
+
+/// The calling window's page lets it close (`onCloseRequested`): `last` when every window of
+/// this process is closing (decided under the registry lock), `jobs` = active jobs. When the
+/// page then keeps the window after all it calls `window_close_cancel`.
+#[tauri::command]
+pub async fn window_close_begin(app: AppHandle, window: WebviewWindow) -> CmdResult<windows::CloseCheck> {
+    windows::close_begin(&app, window.label())
+}
+
+#[tauri::command]
+pub async fn window_close_cancel(app: AppHandle, window: WebviewWindow) -> CmdResult<()> {
+    windows::close_cancel(&app, window.label());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn instances_info(svc: State<'_, Arc<BulkDb>>) -> CmdResult<InstancesInfo> {
+    blocking(&svc, |db| db.instances_info()).await
+}
+
+/// Start another BulkDB process (macOS: `open -n` on the bundle; Windows: the exe, detached).
+#[tauri::command]
+pub async fn instance_spawn(svc: State<'_, Arc<BulkDb>>) -> CmdResult<()> {
+    blocking(&svc, |_| bulk_core::platform::spawn_instance()).await
+}
+
+/// The user accepted "실행 중인 작업 {n}개를 취소하고 종료할까요?": cancel the jobs and exit.
+#[tauri::command]
+pub async fn app_quit_confirmed(app: AppHandle) -> CmdResult<()> {
+    windows::confirm_quit(&app);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +466,7 @@ mod tests {
             prompts: None,
             credentials: Some(Box::new(MemoryStore::default())),
             init_logging: false,
+            ..BulkDbOptions::default()
         })
         .await
         .expect("core starts");
@@ -455,6 +620,7 @@ mod tests {
             prompts: None,
             credentials: Some(Box::new(MemoryStore::default())),
             init_logging: false,
+            ..BulkDbOptions::default()
         })
         .await
         .expect("core restarts");

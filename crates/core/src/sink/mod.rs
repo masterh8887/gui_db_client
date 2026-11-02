@@ -26,6 +26,10 @@ pub struct SinkReport {
     /// Bytes written to disk (after compression).
     pub bytes: u64,
     pub files: Vec<PathBuf>,
+    /// Characters the CSV output encoding could not represent and that were written as `?`
+    /// (always 0 for UTF-8 and Parquet). Summed over split parts; `export.rs` turns a non-zero
+    /// value into a `JobResult` note via [`crate::encoding::unmappable_note`].
+    pub unmappable_chars: u64,
 }
 
 /// A file writer at the end of the pipeline.

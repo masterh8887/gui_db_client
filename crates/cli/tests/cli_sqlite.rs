@@ -554,6 +554,59 @@ fn conn_add_list_test_delete_and_save() {
 }
 
 #[test]
+fn conn_tag_add_show_edit_clear() {
+    let fx = Fixture::new("conn-tag");
+    let o = fx.run(&["conn", "add", "--name", "fixture", "--driver", "sqlite", "--path", fx.db(), "--tag", "production", "--json"]);
+    assert_exit(&o, 0);
+    let saved = json_stdout(&o);
+    assert_eq!(saved["tag"], "production", "{saved}");
+    let id = saved["id"].as_str().expect("id").to_string();
+
+    // Human output names the tag; --json carries it.
+    let o = fx.run(&["conn", "show", "fixture"]);
+    assert_exit(&o, 0);
+    let text = stdout(&o);
+    assert!(text.lines().any(|l| l.starts_with("Tag") && l.trim_end().ends_with("production")), "{text}");
+    assert_eq!(json_stdout(&fx.run(&["conn", "show", &id, "--json"]))["tag"], "production");
+    let o = fx.run(&["conn", "list"]);
+    assert_exit(&o, 0);
+    let text = stdout(&o);
+    assert!(text.lines().next().unwrap_or_default().contains("TAG"), "{text}");
+    assert!(text.lines().any(|l| l.contains("fixture") && l.contains("production")), "{text}");
+    assert_eq!(json_stdout(&fx.run(&["conn", "list", "--json"]))[0]["tag"], "production");
+
+    // An untagged connection has no `tag` key and prints "-".
+    let o = fx.run(&["conn", "add", "--name", "plain", "--driver", "sqlite", "--path", fx.db(), "--json"]);
+    assert_exit(&o, 0);
+    assert!(json_stdout(&o).get("tag").is_none(), "{}", stdout(&o));
+    let o = fx.run(&["conn", "show", "plain"]);
+    assert!(stdout(&o).lines().any(|l| l.starts_with("Tag") && l.trim_end().ends_with('-')), "{}", stdout(&o));
+
+    // edit --tag retags (aliases accepted), --replace keeps the tag, --clear-tag removes it.
+    let o = fx.run(&["conn", "edit", "fixture", "--tag", "stage", "--json"]);
+    assert_exit(&o, 0);
+    assert_eq!(json_stdout(&o)["tag"], "staging");
+    assert_eq!(json_stdout(&o)["id"], id.as_str(), "edit keeps the id");
+    let o = fx.run(&["conn", "add", "--name", "fixture", "--driver", "sqlite", "--path", fx.db(), "--replace", "--json"]);
+    assert_exit(&o, 0);
+    assert_eq!(json_stdout(&o)["tag"], "staging", "--replace without --tag keeps the tag");
+    let o = fx.run(&["conn", "edit", "fixture", "--clear-tag"]);
+    assert_exit(&o, 0);
+    assert!(stdout(&o).contains("removed the environment tag"), "{}", stdout(&o));
+    let shown = json_stdout(&fx.run(&["conn", "show", "fixture", "--json"]));
+    assert!(shown.get("tag").is_none(), "{shown}");
+    let toml = fs::read_to_string(fx.config.join("connections.toml")).expect("connections.toml");
+    assert!(!toml.contains("tag ="), "{toml}");
+
+    // Bad values and contradictory flags are usage errors (exit 1), refused before anything is saved.
+    let o = fx.run(&["conn", "edit", "fixture", "--tag", "prodution"]);
+    assert_exit(&o, 1);
+    let o = fx.run(&["conn", "edit", "fixture", "--tag", "local", "--clear-tag"]);
+    assert_exit(&o, 1);
+    assert!(json_stdout(&fx.run(&["conn", "show", "fixture", "--json"])).get("tag").is_none());
+}
+
+#[test]
 fn conn_import_dbeaver_lists_without_saving() {
     let fx = Fixture::new("dbeaver");
     let path = fx.dir.path().join("data-sources.json");

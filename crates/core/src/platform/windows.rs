@@ -36,3 +36,12 @@ pub fn default_library_dirs() -> Vec<PathBuf> {
     }
     dirs
 }
+
+/// Start a child that outlives this process and has no console: `DETACHED_PROCESS` |
+/// `CREATE_NEW_PROCESS_GROUP` (so a Ctrl+C in a console that started this one never reaches it).
+pub fn detach(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}

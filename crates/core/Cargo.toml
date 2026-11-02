@@ -60,6 +60,12 @@ memory-stats = { workspace = true }
 glob = { workspace = true }
 rand = { workspace = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# WHATWG encodings (EUC-KR = CP949, windows-1252) for legacy MySQL servers and CSV output.
+# Pinned to the version already in Cargo.lock.
+encoding_rs = "0.8.42"
+# SHA-256 for copy plan ids and ack keys (docs/db-copy.md 2). Pinned to the version already in
+# Cargo.lock (no new crate).
+sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
 odbc-api = { workspace = true, optional = true }

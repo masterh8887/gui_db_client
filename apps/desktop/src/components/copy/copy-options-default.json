@@ -1,0 +1,39 @@
+{
+  "content": "both",
+  "existing": "skip",
+  "existingOverrides": [],
+  "objects": {
+    "views": true,
+    "routines": true,
+    "triggers": true,
+    "sequences": true,
+    "types": true,
+    "extensions": true,
+    "comments": true,
+    "owners": false,
+    "grants": false,
+    "analyze": true,
+    "refreshMatviews": true
+  },
+  "nameCase": "keep",
+  "rename": [],
+  "exclude": [],
+  "indexesAfterData": true,
+  "tableConcurrency": 1,
+  "verify": "row_count",
+  "verifySkipped": false,
+  "onUnmappable": "replace",
+  "dryRun": false,
+  "sourceSession": {},
+  "mysql": {
+    "engine": "auto",
+    "zeroDates": "auto",
+    "fixRowSize": true,
+    "keepDefiner": false,
+    "tableOverrides": [],
+    "columns": []
+  },
+  "pg": {
+    "collationFallback": false
+  }
+}

@@ -1,6 +1,11 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, vi } from 'vitest';
+// Only dependency-free modules here: anything that loads the stores (and through them
+// `@/lib/commands`) would be evaluated before a test file's `vi.mock` and escape it.
+import { resetActionRegistry as resetActions } from '@/lib/action-registry';
+import { __resetForTests as resetConfirm } from '@/lib/confirm';
 import { mockBackend } from '@/lib/mock-ipc';
+import { __resetForTests as resetToasts } from '@/lib/toast';
 
 // The Tauri runtime is not present under vitest: `isTauri()` is false, so `@/lib/ipc` routes
 // every call to the in-browser mock backend (`@/lib/mock-ipc`).
@@ -33,4 +38,8 @@ if (typeof window !== 'undefined') {
 afterEach(() => {
   // Clear mock timers / state between tests so a running fake job never leaks.
   mockBackend.reset();
+  // Lib singletons (DESIGN.md §7.1 "Test resets").
+  resetActions();
+  resetToasts();
+  resetConfirm();
 });

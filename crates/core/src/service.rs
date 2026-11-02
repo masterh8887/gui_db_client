@@ -42,11 +42,17 @@ pub struct BulkDbOptions {
     pub credentials: Option<Box<dyn CredentialStore>>,
     /// Install the tracing subscriber (file + ring buffer). The CLI may prefer stderr.
     pub init_logging: bool,
+    /// Register this process in `<config_dir>/instances` (`"desktop"`, `"cli"`;
+    /// docs/db-copy.md 1.2). `None` (tests) registers nothing.
+    pub instance_kind: Option<String>,
+    /// DB copy target test double (`copy::testkit::RecordingTarget`); `None` = the real opener.
+    #[doc(hidden)]
+    pub copy_target_opener: Option<Arc<dyn crate::copy::TargetOpener>>,
 }
 
 impl Default for BulkDbOptions {
     fn default() -> Self {
-        BulkDbOptions { config_dir: None, prompts: None, credentials: None, init_logging: true }
+        BulkDbOptions { config_dir: None, prompts: None, credentials: None, init_logging: true, instance_kind: None, copy_target_opener: None }
     }
 }
 
@@ -81,6 +87,12 @@ pub struct BulkDb {
     pub catalog: CatalogCache,
     /// Long-lived `bulkdb-ui` connections for the catalog browser and EXPLAIN.
     pub browsers: BrowserPool,
+    /// DB copy process state (owner copy-data).
+    pub(crate) copy: crate::copy::api::CopyState,
+    /// This process's instance id (`instances`; the owner of copy run claims).
+    instance_id: String,
+    /// Keeps this process registered in `<config_dir>/instances` (desktop / CLI only).
+    _instance: Option<crate::instances::InstanceGuard>,
     events: broadcast::Sender<CoreEvent>,
     /// Passwords typed this session for connections saved with `save_password = false`
     /// (memory only, dropped with the process).
@@ -97,7 +109,22 @@ impl BulkDb {
         let config = ConfigStore::open(dir.clone())?;
         let logs = Arc::new(LogBuffer::new());
         let settings = config.settings();
+        // Install logging before anything that can log. The instance registration below reports
+        // its failure with `tracing::warn!`; were the subscriber not up yet that line would be
+        // discarded, and a process that failed to register would be invisible to the others with
+        // nothing in the log to say why.
         let log_guard = if opts.init_logging { crate::logging::init(&crate::platform::log_dir(), &settings.log_level, logs.clone())? } else { None };
+        let instance = match opts.instance_kind.as_deref() {
+            Some(kind) => match crate::instances::register(&dir, kind) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    tracing::warn!("cannot register this BulkDB instance: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let instance_id = instance.as_ref().map(|g| g.instance_id().to_string()).unwrap_or_else(crate::instances::new_instance_id);
         // The event bus exists before anything that emits on it: the prompt handler feeds the
         // tunnel manager, the job registry feeds the state machine.
         let (events, _) = broadcast::channel(256);
@@ -127,6 +154,9 @@ impl BulkDb {
             prompts: prompt_events,
             catalog: CatalogCache::new(),
             browsers: BrowserPool::new(),
+            copy: crate::copy::api::CopyState::new(opts.copy_target_opener),
+            instance_id,
+            _instance: instance,
             events,
             session_secrets: Mutex::new(HashMap::new()),
             slots_configured: AtomicUsize::new(slots),
@@ -223,6 +253,10 @@ impl BulkDb {
     fn with_secret_flags(&self, mut c: Connection) -> Connection {
         c.has_password = self.creds.get(&credentials::db_password_key(&c.id)).ok().flatten().is_some();
         c.has_ssh_secret = connect::ssh_secret_key(&c).and_then(|k| self.creds.get(&k).ok().flatten()).is_some();
+        // Whether a password was typed this session for this "ask every time" connection. The
+        // secret itself stays in core (shared by every window); the flag lets another window skip
+        // asking for a password core already holds (db-copy.md 7). `None` when absent: key omitted.
+        c.has_session_password = self.session_secrets.lock().unwrap().contains_key(&c.id).then_some(true);
         c
     }
 
@@ -245,6 +279,9 @@ impl BulkDb {
         let ConnectionInput { mut connection, password, ssh_password, ssh_key_passphrase, clear_password, clear_ssh_secret } = input;
         refuse_unstorable_secrets(&connection)?;
         connection.fields.remove("password");
+        // Output-only, like `has_password`: a caller may echo back what `conn_get` gave it, but it
+        // is recomputed on read and must never be persisted.
+        connection.has_session_password = None;
         let present = |s: Option<String>| s.filter(|v| !v.is_empty());
         let mut password = present(password);
         let ssh_password = present(ssh_password);
@@ -279,6 +316,12 @@ impl BulkDb {
         }
         let saved = self.config.upsert(connection)?;
         let id = saved.id.clone();
+        // The file and cache have changed now. However this returns below — an early `?` from a
+        // keyring call included — the catalog and browser caches of this id must drop and the
+        // windows be told, or this process keeps browsing the old endpoint until restart
+        // (`config_poll` never reports this process's own writes). The guard does all three on
+        // drop, so a keyring failure can no longer skip the notification.
+        let _notify = ConnChangeGuard { db: self, id: id.clone() };
         let db_key = credentials::db_password_key(&id);
         let ssh_pw_key = credentials::ssh_password_key(&id);
         let ssh_pp_key = credentials::ssh_passphrase_key(&id);
@@ -327,9 +370,8 @@ impl BulkDb {
             self.creds.delete(&ssh_pp_key)?;
             tracing::info!(conn_id = %id, "stored ssh secret cleared");
         }
-        // Host / port / credentials may have changed: forget the cached browser connection.
-        self.catalog.invalidate(&id);
-        drop(self.browsers.evict(&id));
+        // Host / port / credentials may have changed: the cached browser connection is forgotten
+        // and `ConnectionsChanged` emitted by `_notify` as it drops at the end of this scope.
         tracing::info!(conn_id = %id, name = %saved.name, driver = %saved.driver, "connection saved");
         Ok(self.with_secret_flags(saved))
     }
@@ -348,6 +390,7 @@ impl BulkDb {
         self.catalog.invalidate(id);
         drop(self.browsers.evict(id));
         tracing::info!(conn_id = %id, "connection deleted");
+        self.emit(CoreEvent::ConnectionsChanged);
         Ok(())
     }
 
@@ -356,10 +399,16 @@ impl BulkDb {
     }
 
     /// Remember a password typed for an "ask every time" connection for this process.
-    fn remember_secret(&self, conn: &Connection, password: Option<String>) {
+    pub(crate) fn remember_secret(&self, conn: &Connection, password: Option<String>) {
         if let Some(p) = password.filter(|p| !p.is_empty()) {
             if !conn.save_password {
-                self.session_secrets.lock().unwrap().insert(conn.id.clone(), p);
+                let previous = self.session_secrets.lock().unwrap().insert(conn.id.clone(), p.clone());
+                // A newly typed (or changed) session password is process-wide state: tell the
+                // other windows so their `hasSessionPassword` updates and they stop asking for a
+                // password core already holds (db-copy.md 1.1 / 7).
+                if previous.as_deref() != Some(p.as_str()) {
+                    self.emit(CoreEvent::ConnectionsChanged);
+                }
             }
         }
     }
@@ -370,8 +419,18 @@ impl BulkDb {
     pub async fn open_connection(&self, conn: &Connection, password: Option<String>, application_name: &str) -> Result<LiveConnection> {
         let password = password.or_else(|| self.session_secrets.lock().unwrap().get(&conn.id).cloned());
         let default_port = self.drivers.get(&conn.driver).and_then(|d| d.defaults.get("port").and_then(|p| p.parse().ok()));
-        let req = ConnectRequest { conn, password, application_name, default_port };
+        let job_label = self.job_label_for_app(application_name);
+        let req = ConnectRequest { conn, password, application_name, default_port, job_label };
         connect::open_connection(req, &*self.creds, &self.tunnels).await
+    }
+
+    /// The label of the job whose sessions are named `application_name` (`bulkdb-<job id>` or
+    /// `bulkdb-<job id>-<session>`), so an SSH prompt raised while that job connects says which
+    /// job it is for. `None` for the UI, preflight, monitor and plan sessions.
+    fn job_label_for_app(&self, application_name: &str) -> Option<String> {
+        let rest = application_name.strip_prefix(crate::APP_NAME_PREFIX)?;
+        let id = rest.split('-').next().filter(|id| !id.is_empty())?;
+        self.jobs.get(id).map(|j| j.label.clone()).filter(|l| !l.trim().is_empty())
     }
 
     /// Tunnel -> connect -> probe. Errors name the failing step.
@@ -722,7 +781,15 @@ impl BulkDb {
     /// permits are added at once, surplus ones are retired as running jobs release them.
     pub fn settings_set(&self, s: Settings) -> Result<Settings> {
         let saved = self.config.set_settings(s)?;
-        let wanted = saved.max_concurrent_jobs.clamp(1, 3) as usize;
+        self.resize_export_slots(saved.max_concurrent_jobs);
+        self.emit(CoreEvent::SettingsChanged(saved.clone()));
+        Ok(saved)
+    }
+
+    /// Size the export slots for `max_concurrent_jobs` (clamped 1..=3): extra permits are added
+    /// at once, surplus ones are retired as running jobs release them.
+    fn resize_export_slots(&self, max_concurrent_jobs: u32) {
+        let wanted = max_concurrent_jobs.clamp(1, 3) as usize;
         let current = self.slots_configured.swap(wanted, Ordering::SeqCst);
         if wanted > current {
             self.jobs.export_slots.add_permits(wanted - current);
@@ -735,7 +802,96 @@ impl BulkDb {
                 }
             });
         }
-        Ok(saved)
+    }
+
+    // ------------------------------------------------------------------ several processes
+
+    /// Pick up `connections.toml` / `settings.toml` changes made by another BulkDB process
+    /// (docs/db-copy.md 1.2; the shell calls this every 2 s). Changed settings resize the export
+    /// slots and emit `SettingsChanged`; changed connections drop their catalog and browser
+    /// caches and emit `ConnectionsChanged`. (Body owner: windows.)
+    pub fn config_poll(&self) -> Result<()> {
+        let change = self.config.reload_if_changed()?;
+        if change.settings {
+            let settings = self.config.settings();
+            self.resize_export_slots(settings.max_concurrent_jobs);
+            self.emit(CoreEvent::SettingsChanged(settings));
+        }
+        if !change.connections.is_empty() {
+            for id in &change.connections {
+                self.catalog.invalidate(id);
+                drop(self.browsers.evict(id));
+            }
+            self.emit(CoreEvent::ConnectionsChanged);
+        }
+        Ok(())
+    }
+
+    /// The other live BulkDB processes on this config directory. (Body owner: windows.)
+    pub fn instances_info(&self) -> Result<InstancesInfo> {
+        crate::instances::info(self.config.dir())
+    }
+
+    /// This process's instance id (uuid v4).
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    // ------------------------------------------------------------------ DB copy
+    // Thin delegations to `copy::api` (docs/db-copy.md 6.1; owner copy-data).
+
+    /// Plan a copy without creating a job (sessions `bulkdb-copyplan`).
+    pub async fn copy_plan(&self, req: &CopyRequest, plan_token: Option<String>) -> Result<CopyPlan> {
+        crate::copy::api::copy_plan(self, req, plan_token).await
+    }
+
+    /// Cancel a running `copy_plan` (`CANCELLED` within ~2 s).
+    pub fn copy_plan_cancel(&self, plan_token: &str) -> Result<()> {
+        crate::copy::api::copy_plan_cancel(self, plan_token)
+    }
+
+    /// Start a copy bound to the reviewed `plan_id`; `acknowledged` are ack keys. Job id.
+    pub async fn copy_start(&self, req: CopyRequest, plan_id: String, acknowledged: Vec<String>) -> Result<String> {
+        crate::copy::api::copy_start(self.me()?, req, plan_id, acknowledged).await
+    }
+
+    /// Resume a run as a new job of the same run. Job id.
+    pub async fn copy_resume(&self, req: CopyResumeRequest) -> Result<String> {
+        crate::copy::api::copy_resume(self.me()?, req).await
+    }
+
+    pub fn copy_status(&self, job_id: &str) -> Result<CopyStatus> {
+        crate::copy::api::copy_status(self, job_id)
+    }
+
+    /// Runs whose source or target is `conn_id` (all when `None`), newest first.
+    pub fn copy_runs(&self, conn_id: Option<&str>, limit: usize) -> Result<Vec<CopyRunInfo>> {
+        crate::copy::api::copy_runs(self, conn_id, limit)
+    }
+
+    pub fn copy_run(&self, run_id: &str) -> Result<CopyRunDetail> {
+        crate::copy::api::copy_run(self, run_id)
+    }
+
+    /// Delete a run and its checkpoints; refuses an in-use run.
+    pub fn copy_forget(&self, run_id: &str) -> Result<()> {
+        crate::copy::api::copy_forget(self, run_id)
+    }
+
+    /// Full progress per active copy job (the shell polls this every 500 ms).
+    pub fn copy_progress_snapshot(&self) -> Vec<CopyProgress> {
+        crate::copy::api::copy_progress_snapshot(self)
+    }
+
+    /// A plan this process made recently (`PLAN_CHANGED` details, `bulk-cli copy run
+    /// --expect-plan`).
+    pub fn copy_recent_plan(&self, plan_id: &str) -> Option<CopyPlan> {
+        self.copy.recent_plan(plan_id)
+    }
+
+    /// A weak handle on this core, for the copy target opener (owner copy-data).
+    pub(crate) fn copy_weak(&self) -> std::sync::Weak<BulkDb> {
+        self.me.clone()
     }
 
     // ------------------------------------------------------------------ prompts / misc
@@ -886,6 +1042,22 @@ impl BulkDb {
     }
 }
 
+/// Invalidates one connection's catalog + browser caches and emits `ConnectionsChanged` when
+/// dropped, so a `conn_save` that returns early on a keyring error after `config.upsert` still
+/// drops the stale caches and tells this process's windows (see `conn_save`).
+struct ConnChangeGuard<'a> {
+    db: &'a BulkDb,
+    id: String,
+}
+
+impl Drop for ConnChangeGuard<'_> {
+    fn drop(&mut self) {
+        self.db.catalog.invalidate(&self.id);
+        drop(self.db.browsers.evict(&self.id));
+        self.db.emit(CoreEvent::ConnectionsChanged);
+    }
+}
+
 /// `INVALID` when the ODBC `connection_string` field carries a secret attribute other than the
 /// password (see `connect::connection_string_unstorable_secrets`): there is nowhere to keep it,
 /// and it must never reach `connections.toml` or `conn_list`. The message names the keywords
@@ -1021,6 +1193,20 @@ fn with_lock_detail(e: CoreError, sessions: &[SessionInfo]) -> CoreError {
 mod tests {
     use super::*;
 
+    /// A credential store whose `set` always fails, to drive the keyring-error path of `conn_save`.
+    struct FailOnSet;
+    impl crate::credentials::CredentialStore for FailOnSet {
+        fn get(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &str) -> Result<()> {
+            Err(CoreError::Internal("keyring unavailable".into()))
+        }
+        fn delete(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn redacts_secret_keys_only() {
         let text = "[[connections]]\nname = \"x\"\npassword = \"p\"\nssh_passphrase = \"q\"\nhost = \"h\"\n";
@@ -1051,6 +1237,27 @@ mod tests {
         assert_eq!(unchanged.to_string(), "x");
     }
 
+    /// SSH prompts raised while a job connects carry that job's label: its sessions are named
+    /// `bulkdb-<job id>` (export) or `bulkdb-<job id>-<session>` (copy).
+    #[tokio::test]
+    async fn job_label_follows_the_application_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.path().to_path_buf()),
+            credentials: Some(Box::new(crate::credentials::MemoryStore::default())),
+            init_logging: false,
+            ..BulkDbOptions::default()
+        })
+        .await
+        .unwrap();
+        let job = db.jobs.create(crate::types::JobKind::Export, "c", "conn", "orders → csv", None);
+        assert_eq!(db.job_label_for_app(&format!("bulkdb-{}", job.id)).as_deref(), Some("orders → csv"));
+        assert_eq!(db.job_label_for_app(&format!("bulkdb-{}-t3", job.id)).as_deref(), Some("orders → csv"));
+        for app in [APP_NAME_UI, "bulkdb-copyplan", "bulkdb-preflight", "bulkdb-", "other", "bulkdb-unknown-s1"] {
+            assert_eq!(db.job_label_for_app(app), None, "{app}");
+        }
+    }
+
     /// `clear_password` also forgets a password typed for the connection this session, so a
     /// cleared connection really asks again.
     #[tokio::test]
@@ -1061,6 +1268,7 @@ mod tests {
             prompts: None,
             credentials: Some(Box::new(crate::credentials::MemoryStore::default())),
             init_logging: false,
+            ..BulkDbOptions::default()
         })
         .await
         .unwrap();
@@ -1077,6 +1285,86 @@ mod tests {
         // ... clearing the password drops it.
         db.conn_save(ConnectionInput { connection: saved.clone(), clear_password: true, ..Default::default() }).unwrap();
         assert!(!remembered(&db));
+    }
+
+    /// A keyring failure after the connection file was written must not skip the cache
+    /// invalidation and `ConnectionsChanged`: the endpoint on disk changed, so the windows and
+    /// caches have to catch up even though the save returns an error.
+    #[tokio::test]
+    async fn conn_save_notifies_even_when_the_keyring_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.path().to_path_buf()),
+            credentials: Some(Box::new(FailOnSet)),
+            init_logging: false,
+            ..BulkDbOptions::default()
+        })
+        .await
+        .unwrap();
+        let mut rx = db.subscribe();
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("path".to_string(), dir.path().join("x.db").display().to_string());
+        // save_password = true plus a password routes to `creds.set`, which fails here.
+        let conn = Connection { name: "x".into(), driver: "sqlite".into(), fields, save_password: true, ..Default::default() };
+        let err = db.conn_save(ConnectionInput { connection: conn, password: Some("p".into()), ..Default::default() }).unwrap_err();
+        assert_eq!(err.code(), "INTERNAL");
+        // The write happened, so the notification must have gone out regardless.
+        let saw = std::iter::from_fn(|| rx.try_recv().ok()).any(|ev| matches!(ev, CoreEvent::ConnectionsChanged));
+        assert!(saw, "conn_save must emit ConnectionsChanged even when the keyring set fails");
+        assert_eq!(db.conn_list().len(), 1, "the connection really is on disk");
+    }
+
+    /// An instance-registration failure is logged. Logging must be installed before the
+    /// registration runs, or the warning is discarded (it used to register first).
+    #[tokio::test]
+    async fn instance_registration_failure_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        // A plain file where the instances directory should be: `register` cannot create the dir.
+        std::fs::write(dir.path().join(crate::instances::INSTANCES_DIR), b"not a dir").unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.path().to_path_buf()),
+            credentials: Some(Box::new(crate::credentials::MemoryStore::default())),
+            init_logging: true,
+            instance_kind: Some("desktop".into()),
+            ..BulkDbOptions::default()
+        })
+        .await
+        .unwrap();
+        // Registration failed (non-fatal) but its reason reached the log buffer the UI reads.
+        let logged = db.logs_recent(crate::logging::RING_CAPACITY).iter().any(|e| e.message.contains("cannot register this BulkDB instance"));
+        assert!(logged, "the registration failure must be logged now that logging is set up first");
+    }
+
+    /// The session-password flag is reported on `conn_get` and a newly typed one announces itself
+    /// so other windows stop asking for a password core already holds (db-copy.md 7). It is never
+    /// written to disk.
+    #[tokio::test]
+    async fn session_password_is_reported_and_announced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.path().to_path_buf()),
+            credentials: Some(Box::new(crate::credentials::MemoryStore::default())),
+            init_logging: false,
+            ..BulkDbOptions::default()
+        })
+        .await
+        .unwrap();
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("path".to_string(), dir.path().join("x.db").display().to_string());
+        let conn = Connection { name: "ask".into(), driver: "sqlite".into(), fields, save_password: false, ..Default::default() };
+        let saved = db.conn_save(ConnectionInput { connection: conn, ..Default::default() }).unwrap();
+        // No session password yet: the key is omitted.
+        assert_eq!(db.conn_get(&saved.id).unwrap().has_session_password, None);
+        let mut rx = db.subscribe();
+        db.remember_secret(&saved, Some("typed".into()));
+        assert_eq!(db.conn_get(&saved.id).unwrap().has_session_password, Some(true));
+        // Remembering it announced the change to the other windows ...
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|ev| matches!(ev, CoreEvent::ConnectionsChanged)));
+        // ... but remembering the same password again does not re-announce.
+        db.remember_secret(&saved, Some("typed".into()));
+        assert!(rx.try_recv().is_err());
+        let text = std::fs::read_to_string(db.config.connections_path()).unwrap();
+        assert!(!text.contains("hasSessionPassword") && !text.contains("has_session_password"), "{text}");
     }
 
     #[test]

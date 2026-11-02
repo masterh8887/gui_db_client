@@ -1,8 +1,18 @@
-# Integration-test databases: `docker compose -f docker/compose.yml up -d`, then
+# Integration-test databases: `docker compose -f docker/compose.yml up -d --wait`, then
 #   BULKDB_PG_URL=postgres://bulkdb:bulkdb@127.0.0.1:5432/bulkdb \
+#   BULKDB_PG16_URL=postgres://bulkdb:bulkdb@127.0.0.1:5433/bulkdb \
+#   BULKDB_PG17_URL=postgres://bulkdb:bulkdb@127.0.0.1:5434/bulkdb \
 #   BULKDB_MYSQL_URL=mysql://root:bulkdb@127.0.0.1:3306/bulkdb \
+#   BULKDB_MYSQL55_URL=mysql://root:bulkdb@127.0.0.1:3307/bulkdb \
+#   BULKDB_MYSQL9_URL=mysql://root:bulkdb@127.0.0.1:3308/bulkdb \
 #   BULKDB_MSSQL_URL="mssql://sa:BulkDb%21Passw0rd@127.0.0.1:1433/master" \
 #   cargo test -p bulk-core --features it
+#
+# DB copy (crates/core/tests/copy_it.rs, docs/db-copy.md section 9) uses postgres (15) as the
+# source for postgres16 / postgres17, and mysql55 (euckr) as the source for mysql (8) / mysql9.
+# Optional: a MySQL 4.0 server built from the 4.0.27 binaries (no public image exists) published
+# on 3309 and named by BULKDB_MYSQL40_URL=mysql://root:<password>@127.0.0.1:3309/test; without
+# it that test skips itself.
 services:
   postgres:
     image: postgres:15
@@ -12,12 +22,81 @@ services:
       POSTGRES_DB: bulkdb
     command: ["postgres", "-c", "shared_buffers=1GB", "-c", "work_mem=4MB"]
     ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bulkdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  postgres16:
+    # DB copy target (BULKDB_PG16_URL).
+    image: postgres:16
+    environment:
+      POSTGRES_USER: bulkdb
+      POSTGRES_PASSWORD: bulkdb
+      POSTGRES_DB: bulkdb
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bulkdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  postgres17:
+    # DB copy target (BULKDB_PG17_URL).
+    image: postgres:17
+    environment:
+      POSTGRES_USER: bulkdb
+      POSTGRES_PASSWORD: bulkdb
+      POSTGRES_DB: bulkdb
+    ports: ["5434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bulkdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
   mysql:
     image: mysql:8
     environment:
       MYSQL_ROOT_PASSWORD: bulkdb
       MYSQL_DATABASE: bulkdb
     ports: ["3306:3306"]
+    healthcheck:
+      # Over TCP: the image's first-start initialisation runs a temporary --skip-networking server.
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -P3306 -uroot -pbulkdb --silent"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+  mysql9:
+    # DB copy target (BULKDB_MYSQL9_URL). MySQL 9.x has no mysql_native_password: root
+    # authenticates with caching_sha2_password.
+    image: mysql:9
+    environment:
+      MYSQL_ROOT_PASSWORD: bulkdb
+      MYSQL_DATABASE: bulkdb
+    ports: ["3308:3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -P3306 -uroot -pbulkdb --silent"]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+  mysql55:
+    # Legacy MySQL for mysql_it.rs and copy_it.rs (BULKDB_MYSQL55_URL): an EUC-KR server that
+    # hashes passwords the pre-4.1 way (root gets such a hash). The image is amd64 only
+    # (emulated on Apple silicon).
+    image: mysql:5.5
+    platform: linux/amd64
+    environment:
+      MYSQL_ROOT_PASSWORD: bulkdb
+      MYSQL_DATABASE: bulkdb
+    command: ["--character-set-server=euckr", "--collation-server=euckr_korean_ci", "--old-passwords=1", "--secure-auth=0"]
+    ports: ["3307:3306"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -P3306 -uroot -pbulkdb --silent"]
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 40
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:

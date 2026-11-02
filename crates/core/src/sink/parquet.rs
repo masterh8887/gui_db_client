@@ -296,12 +296,12 @@ impl Sink for ParquetSink {
     /// keep its final name. A file this sink did not create (overwrite refused) is left alone.
     fn finish(mut self: Box<Self>) -> Result<SinkReport> {
         if self.writer.is_none() && self.schema.is_none() {
-            return Ok(SinkReport { rows: 0, bytes: 0, files: vec![] });
+            return Ok(SinkReport::default());
         }
         match self.close() {
             Ok(bytes) => {
                 self.final_bytes = Some(bytes);
-                Ok(SinkReport { rows: self.rows, bytes, files: vec![self.path.clone()] })
+                Ok(SinkReport { rows: self.rows, bytes, files: vec![self.path.clone()], unmappable_chars: 0 })
             }
             Err(e) => {
                 drop(self.writer.take());

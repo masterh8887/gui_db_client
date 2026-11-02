@@ -136,6 +136,9 @@ pub struct ConnectRequest<'a> {
     pub application_name: &'a str,
     /// Port used when the connection has none (the driver's registry default).
     pub default_port: Option<u16>,
+    /// Label of the job opening the connection, shown with the connection name in the SSH
+    /// host-key and password prompts (docs/db-copy.md 1.1); `None` outside a job.
+    pub job_label: Option<String>,
 }
 
 /// Well-known default ports, used when the registry gives none.
@@ -364,7 +367,8 @@ pub async fn open_connection(req: ConnectRequest<'_>, creds: &dyn CredentialStor
             None => None,
         };
         tracing::info!(conn_id = %conn.id, bastion = %ssh.host, target = %format!("{target_host}:{port}"), "acquiring ssh tunnel");
-        let l = tunnels.acquire(ssh, &target_host, port, secret).await.map_err(|e| step_error(Step::Tunnel, e))?;
+        let context = tunnel::PromptContext { conn_name: Some(conn.name.clone()).filter(|n| !n.trim().is_empty()), job_label: req.job_label.clone() };
+        let l = tunnels.acquire_with(ssh, &target_host, port, secret, context).await.map_err(|e| step_error(Step::Tunnel, e))?;
         tracing::info!(conn_id = %conn.id, local_port = l.local_port, "tunnel ready");
         lease = Some(l);
         tunnel_used = true;
@@ -506,7 +510,7 @@ mod tests {
         let creds = MemoryStore::default();
         let tunnels = TunnelManager::new(std::sync::Arc::new(tunnel::DenyAllPrompts), Duration::from_secs(1));
         let conn = Connection { id: "c".into(), name: "n".into(), driver: "db2".into(), ..Default::default() };
-        let req = ConnectRequest { conn: &conn, password: None, application_name: "bulkdb-ui", default_port: None };
+        let req = ConnectRequest { conn: &conn, password: None, application_name: "bulkdb-ui", default_port: None, job_label: None };
         assert!(matches!(open_connection(req, &creds, &tunnels).await, Err(CoreError::DriverMissing { .. })));
 
         let conn = Connection {
@@ -517,7 +521,7 @@ mod tests {
             ssh: Some(SshConfig { enabled: true, host: "b".into(), port: 22, user: "u".into(), auth: SshAuth::Key, key_path: Some("k.ppk".into()), compression: true }),
             ..Default::default()
         };
-        let req = ConnectRequest { conn: &conn, password: None, application_name: "bulkdb-ui", default_port: None };
+        let req = ConnectRequest { conn: &conn, password: None, application_name: "bulkdb-ui", default_port: None, job_label: None };
         let err = open_connection(req, &creds, &tunnels).await.unwrap_err();
         assert!(matches!(err, CoreError::Tunnel(ref m) if m.contains("PuTTY")), "{err}");
     }

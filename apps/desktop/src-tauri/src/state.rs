@@ -2,7 +2,7 @@
 //!
 //! The only thing Tauri manages is an `Arc<BulkDb>` (the bulk-core facade). It is built once in
 //! `setup` and torn down (`BulkDb::shutdown`, which kills ssh tunnels and cancels jobs) when the
-//! main window is destroyed or the app is asked to exit.
+//! last window is destroyed or the app exits (docs/db-copy.md 1.1).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::time::Instant;
 use bulk_core::service::BulkDbOptions;
 use bulk_core::{BulkDb, CoreError, ErrorPayload};
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 /// Error returned by every `invoke` handler. Serialises as the bare `ErrorPayload` object
 /// (`{ code, message, detail? }`) so the frontend sees exactly one error shape.
@@ -76,7 +76,7 @@ pub type CmdResult<T> = Result<T, CmdError>;
 /// tunnel prompts, file + ring-buffer logging). Runs on the main thread inside `setup`, so the
 /// async constructor is driven with `block_on`.
 pub fn init(started: Instant) -> Result<Arc<BulkDb>, CoreError> {
-    let db = tauri::async_runtime::block_on(BulkDb::new(BulkDbOptions::default()))?;
+    let db = tauri::async_runtime::block_on(BulkDb::new(BulkDbOptions { instance_kind: Some("desktop".into()), ..BulkDbOptions::default() }))?;
     tracing::info!(
         config_dir = %db.config.dir().display(),
         log_dir = %bulk_core::platform::log_dir().display(),
@@ -102,10 +102,10 @@ where
 
 static SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Cancel jobs and kill tunnels. Idempotent: `ExitRequested` and the main window's `Destroyed`
-/// both route here and only the first call does work. Runs on the main thread (event loop
-/// callback), so blocking on the async runtime is safe.
-pub fn shutdown(app: &AppHandle) {
+/// Cancel jobs and kill tunnels. Idempotent: an allowed `ExitRequested` and the `Destroyed` of
+/// the last window both route here and only the first call does work. Runs on the main thread
+/// (event loop callback), so blocking on the async runtime is safe.
+pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     if SHUTDOWN_DONE.swap(true, Ordering::SeqCst) {
         return;
     }

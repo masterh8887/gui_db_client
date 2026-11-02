@@ -82,6 +82,15 @@ export function importRowStatus(row: ImportedConnection, drivers: DriverInfo[], 
   return driver.available ? 'ok' : 'driverMissing';
 }
 
+/**
+ * Monotonic id of the newest `load()` call. `conn_save` now emits `connections:changed` on every
+ * save (DBeaver imports fire one per row), so several `load()` calls overlap; `conn_list` does a
+ * keyring lookup per connection, so a response can arrive after a newer one. Each call captures
+ * its id and applies only while it is still the newest, so a slow response never overwrites a
+ * fresher list.
+ */
+let loadSeq = 0;
+
 export const useConnectionsStore = create<ConnectionsState>()((set, get) => ({
   connections: [],
   drivers: [],
@@ -94,17 +103,29 @@ export const useConnectionsStore = create<ConnectionsState>()((set, get) => ({
   loaded: false,
 
   load: async () => {
+    const seq = ++loadSeq;
     set({ loading: true });
     try {
       const [connections, drivers] = await Promise.all([connList(), driversList()]);
-      set((s) => ({
-        connections,
-        drivers,
-        loaded: true,
-        selectedId: s.selectedId && connections.some((c) => c.id === s.selectedId) ? s.selectedId : (connections[0]?.id ?? null),
-      }));
+      // A newer load() already started: drop this stale response rather than overwrite it.
+      if (seq !== loadSeq) return;
+      set((s) => {
+        // Reconcile the per-window "unlocked" hints with core's authoritative session-password
+        // flag: drop any whose connection no longer reports a session password (another window
+        // may have cleared or replaced it), so this window asks again instead of failing with
+        // AUTH (db-copy.md 1.1).
+        const unlocked: Record<string, boolean> = {};
+        for (const c of connections) if (s.unlocked[c.id] && c.hasSessionPassword) unlocked[c.id] = true;
+        return {
+          connections,
+          drivers,
+          loaded: true,
+          unlocked,
+          selectedId: s.selectedId && connections.some((c) => c.id === s.selectedId) ? s.selectedId : (connections[0]?.id ?? null),
+        };
+      });
     } finally {
-      set({ loading: false });
+      if (seq === loadSeq) set({ loading: false });
     }
   },
 
@@ -221,6 +242,9 @@ export function needsSessionPassword(s: ConnectionsState, connId: string | null 
   const conn = s.connections.find((c) => c.id === connId);
   if (!conn || conn.savePassword) return false;
   if (!selectDriver(s, conn.driver)?.fields.includes('password')) return false;
+  // Core holds a session password already (typed in any window): no need to ask (db-copy.md 7).
+  if (conn.hasSessionPassword) return false;
+  // Otherwise fall back to the optimistic per-window hint from this session's own test/unlock.
   return !s.unlocked[conn.id];
 }
 

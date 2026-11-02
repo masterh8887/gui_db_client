@@ -47,6 +47,9 @@ pub struct DriverDef {
     pub fields: Vec<String>,
     #[serde(default)]
     pub defaults: BTreeMap<String, String>,
+    /// Allowed values of enumerated fields (`"protocol": ["auto", "modern", "legacy"]`).
+    #[serde(default)]
+    pub choices: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub session_opts: Vec<String>,
 }
@@ -144,6 +147,7 @@ pub fn detect(def: &DriverDef) -> DriverInfo {
         install_hint: install_command.clone(),
         fields: def.fields.clone(),
         defaults: def.defaults.clone(),
+        choices: (!def.choices.is_empty()).then(|| def.choices.clone()),
         session_opts: def.session_opts.clone(),
         odbc_drivers: vec![],
         library_path: None,
@@ -266,6 +270,43 @@ mod tests {
         assert_eq!(cmd, None);
     }
 
+    /// Select fields (`choices`) must be declared fields, their defaults must be one of the
+    /// choices, and the MySQL choices must be values the driver accepts.
+    #[test]
+    fn bundled_choices_are_consistent() {
+        let defs: Vec<DriverDef> = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        for d in &defs {
+            for (field, values) in &d.choices {
+                assert!(d.fields.contains(field), "{}: choices for undeclared field {field}", d.id);
+                assert!(!values.is_empty(), "{}: empty choices for {field}", d.id);
+                if let Some(default) = d.defaults.get(field) {
+                    assert!(values.contains(default), "{}: default {field}={default} is not one of {values:?}", d.id);
+                }
+            }
+        }
+        let mysql = defs.iter().find(|d| d.id == "mysql").unwrap();
+        for field in ["protocol", "encoding", "allow_old_password"] {
+            assert!(mysql.fields.iter().any(|f| f == field), "mysql lacks the {field} field");
+        }
+        assert_eq!(mysql.defaults.get("protocol").map(String::as_str), Some("auto"));
+        assert_eq!(mysql.defaults.get("encoding").map(String::as_str), Some("auto"));
+        assert_eq!(mysql.defaults.get("allow_old_password").map(String::as_str), Some("false"));
+        #[cfg(feature = "mysql")]
+        {
+            use crate::source::mysql_dispatch::{EncodingSetting, ProtocolSetting};
+            for v in &mysql.choices["protocol"] {
+                assert_eq!(ProtocolSetting::parse(v).unwrap().as_str(), v);
+            }
+            for v in &mysql.choices["encoding"] {
+                assert_eq!(EncodingSetting::parse(v).unwrap().as_str(), v);
+            }
+        }
+        let info = detect(mysql);
+        assert_eq!(info.choices.as_ref().map(|c| c.contains_key("encoding")), Some(true));
+        let sqlite = defs.iter().find(|d| d.id == "sqlite").unwrap();
+        assert_eq!(detect(sqlite).choices, None, "drivers without select fields send no choices");
+    }
+
     #[test]
     fn install_link_classification() {
         assert!(is_install_link("https://example.com/download"));
@@ -292,6 +333,7 @@ mod tests {
             install: Some(Install { label: Some("Test Client".into()), links: oses.iter().map(|o| (o.to_string(), entry.to_string())).collect() }),
             fields: vec![],
             defaults: BTreeMap::new(),
+            choices: BTreeMap::new(),
             session_opts: vec![],
         }
     }

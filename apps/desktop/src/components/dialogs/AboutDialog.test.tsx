@@ -5,17 +5,19 @@ import { setLang } from '@/lib/i18n';
 import { mockDrivers } from '@/lib/mock-data';
 import { mockBackend } from '@/lib/mock-ipc';
 import { useConnectionsStore } from '@/stores/connections';
+import { useUiStore } from '@/stores/ui';
 import { resetStores } from '@/test/stores';
 import { TooltipProvider } from '@/components/ui';
-import { AboutDialog, aboutText, platformName } from './AboutDialog';
+import { AboutDialog, aboutText, middleTruncate, platformName } from './AboutDialog';
 
 beforeAll(() => setLang('en'));
 afterAll(() => setLang('ko'));
 
-function renderDialog(onOpenChange = vi.fn()) {
+function renderDialog() {
+  useUiStore.setState({ aboutOpen: true });
   return render(
     <TooltipProvider>
-      <AboutDialog open onOpenChange={onOpenChange} />
+      <AboutDialog />
     </TooltipProvider>,
   );
 }
@@ -80,20 +82,39 @@ describe('AboutDialog', () => {
     expect(mockBackend.calls).not.toContain('diagnostics_bundle');
   });
 
-  it('closes through onOpenChange', async () => {
+  it('reads ui.aboutOpen (no props) and closes through it', async () => {
     const user = userEvent.setup();
-    const onOpenChange = vi.fn();
-    renderDialog(onOpenChange);
+    renderDialog();
     await screen.findByText('0.1.0-mock');
-    const dialog = screen.getByRole('dialog');
-    await user.click(within(dialog).getAllByRole('button', { name: 'Close' }).at(-1)!);
-    expect(onOpenChange).toHaveBeenCalledWith(false);
+    const dialog = screen.getByRole('dialog', { name: 'About BulkDB' });
+    await user.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(useUiStore.getState().aboutOpen).toBe(false);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('closes with Esc', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+    await screen.findByText('0.1.0-mock');
+    await user.keyboard('{Escape}');
+    expect(useUiStore.getState().aboutOpen).toBe(false);
   });
 
   it('renders nothing when closed', () => {
-    render(<AboutDialog open={false} onOpenChange={vi.fn()} />);
+    render(<AboutDialog />);
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(mockBackend.calls).not.toContain('app_info');
+  });
+
+  it('copies the support summary and says so', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    renderDialog();
+    await screen.findByText('0.1.0-mock');
+    await user.click(screen.getByRole('button', { name: /Copy info/ }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(expect.stringMatching(/^BulkDB 0\.1\.0-mock\n/)));
+    expect(await screen.findAllByText('Copied')).not.toHaveLength(0);
   });
 
   it('formats the support summary', () => {
@@ -111,5 +132,15 @@ describe('AboutDialog', () => {
     ]);
     expect(platformName('windows')).toBe('Windows');
     expect(platformName('freebsd')).toBe('freebsd');
+  });
+
+  it('shortens long paths in the middle', () => {
+    expect(middleTruncate('/short')).toBe('/short');
+    const long = 'C:\\Users\\someone\\AppData\\Roaming\\BulkDB\\config\\deeply\\nested\\folder';
+    const out = middleTruncate(long, 30);
+    expect(out).toHaveLength(30);
+    expect(out.startsWith('C:\\Users')).toBe(true);
+    expect(out.endsWith('folder')).toBe(true);
+    expect(out).toContain('…');
   });
 });

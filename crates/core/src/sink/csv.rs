@@ -1,10 +1,15 @@
 //! CSV sink: RawCsv batches are written as-is; Arrow batches are formatted row by row with the
-//! `csv` crate (RFC 4180 quoting, configurable delimiter / NULL text / CRLF / BOM).
+//! `csv` crate (RFC 4180 quoting, configurable delimiter / NULL text / CRLF / BOM / encoding).
 //!
 //! One `CsvSink` is one file. The writer it is given is already open (the factory in
 //! [`crate::sink::split`] creates files lazily and checks the overwrite rule); the sink adds a
-//! 1 MB `BufWriter` and a byte counter in front of it. Nothing beyond one batch, the cell
-//! scratch buffer and that 1 MB buffer is ever held in memory.
+//! 1 MB `BufWriter`, the output encoder and a byte counter in front of it:
+//! `BufWriter -> TranscodeWriter -> CountingWriter -> W`. Everything above the encoder is UTF-8
+//! (Arrow-formatted cells, header, NULL text, RawCsv chunks from PostgreSQL COPY); with
+//! `CsvOpts.encoding = euc-kr` the encoder writes CP949 and the counter (and so splitting and
+//! progress) sees encoded bytes. Characters CP949 cannot represent become `?` and are counted
+//! in `SinkReport::unmappable_chars`. Nothing beyond one batch, the cell
+//! scratch buffer, that 1 MB buffer and the encoder's 64 KB step buffer is ever held in memory.
 
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -16,18 +21,20 @@ use arrow_array::RecordBatch;
 use bytes::Bytes;
 use csv::{QuoteStyle, Terminator, WriterBuilder};
 
+use crate::encoding::{Charset, TranscodeWriter};
 use crate::error::{CoreError, Result};
 use crate::sink::compress::{CompressWriter, CountingWriter};
 use crate::sink::{Sink, SinkReport};
 use crate::source::Batch;
-use crate::types::CsvOpts;
+use crate::types::{CsvEncoding, CsvOpts};
 
 /// Size of the buffer in front of the file / compressor.
 pub const FILE_BUFFER_BYTES: usize = 1024 * 1024;
 /// Internal buffer of the per-batch `csv::Writer` (flushes into the 1 MB buffer above).
 const CSV_BUFFER_BYTES: usize = 64 * 1024;
 
-/// UTF-8 byte order mark written first when `CsvOpts.bom` is set.
+/// UTF-8 byte order mark written first when [`CsvOpts::writes_bom`] (`bom` set and the encoding
+/// is UTF-8; never for EUC-KR).
 pub const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 /// `Date32` columns.
 pub const DATE_FORMAT: &str = "%Y-%m-%d";
@@ -47,12 +54,31 @@ pub fn delimiter_byte(opts: &CsvOpts) -> Result<u8> {
     }
 }
 
+/// Output-encoding check: with EUC-KR the delimiter must not be an ASCII letter. CP949 trail
+/// bytes include `A-Z` and `a-z` (never `,`, `;`, tab, `|`, `"`, CR or LF), so a letter
+/// delimiter would show up inside encoded characters that the UTF-8 quoting never saw.
+pub fn check_encoding(opts: &CsvOpts) -> Result<()> {
+    if opts.effective_encoding() == CsvEncoding::EucKr {
+        let d = delimiter_byte(opts)?;
+        if d.is_ascii_alphabetic() {
+            return Err(CoreError::Invalid(format!(
+                "csv delimiter {:?} cannot be used with the euc-kr encoding (CP949 characters contain ASCII letters as their second byte)",
+                d as char
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Closure that closes the output writer and returns the on-disk byte count. Set for
 /// compressed outputs, where the count only exists once the compressor thread has finished.
 type Finisher<W> = Box<dyn FnOnce(W) -> Result<u64> + Send>;
 
+/// The writer stack in front of `W`: buffer (UTF-8) -> output encoder -> byte counter.
+type Out<W> = BufWriter<TranscodeWriter<CountingWriter<W>>>;
+
 pub struct CsvSink<W: Write + Send> {
-    out: Option<BufWriter<CountingWriter<W>>>,
+    out: Option<Out<W>>,
     opts: CsvOpts,
     path: PathBuf,
     delimiter: u8,
@@ -72,6 +98,8 @@ pub struct CsvSink<W: Write + Send> {
     final_bytes: Option<u64>,
     /// Scratch buffer for one formatted cell.
     cell: String,
+    /// Characters written as `?` (EUC-KR output), final once the sink is closed.
+    unmappable: u64,
 }
 
 impl<W: Write + Send> CsvSink<W> {
@@ -81,8 +109,9 @@ impl<W: Write + Send> CsvSink<W> {
         let delimiter = delimiter_byte(&opts).unwrap_or(b',');
         let counting = CountingWriter::new(writer);
         let own_bytes = counting.counter();
+        let encoder = TranscodeWriter::new(counting, Charset::from(opts.effective_encoding()));
         CsvSink {
-            out: Some(BufWriter::with_capacity(FILE_BUFFER_BYTES, counting)),
+            out: Some(BufWriter::with_capacity(FILE_BUFFER_BYTES, encoder)),
             opts,
             path,
             delimiter,
@@ -95,12 +124,15 @@ impl<W: Write + Send> CsvSink<W> {
             finisher: None,
             final_bytes: None,
             cell: String::with_capacity(256),
+            unmappable: 0,
         }
     }
 
-    /// Validate the options up front (delimiter); `new` falls back to `,` silently.
+    /// Validate the options up front (delimiter, delimiter vs encoding); `new` falls back to
+    /// `,` silently.
     pub fn validate(opts: &CsvOpts) -> Result<()> {
-        delimiter_byte(opts).map(|_| ())
+        delimiter_byte(opts)?;
+        check_encoding(opts)
     }
 
     /// Rows written so far.
@@ -108,12 +140,20 @@ impl<W: Write + Send> CsvSink<W> {
         self.rows
     }
 
+    /// Characters written as `?` so far (bytes still in the 1 MB buffer are not encoded yet).
+    pub fn unmappable_chars(&self) -> u64 {
+        match &self.out {
+            Some(out) => out.get_ref().unmappable(),
+            None => self.unmappable,
+        }
+    }
+
     /// Path of the file this sink writes.
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
-    fn out(&mut self) -> Result<&mut BufWriter<CountingWriter<W>>> {
+    fn out(&mut self) -> Result<&mut Out<W>> {
         self.out.as_mut().ok_or_else(|| CoreError::Io("csv sink is closed".into()))
     }
 
@@ -121,7 +161,7 @@ impl<W: Write + Send> CsvSink<W> {
     fn begin(&mut self) -> Result<()> {
         if !self.started {
             self.started = true;
-            if self.opts.bom {
+            if self.opts.writes_bom() {
                 self.out()?.write_all(UTF8_BOM)?;
             }
         }
@@ -195,7 +235,9 @@ impl<W: Write + Send> CsvSink<W> {
         self.begin()?;
         let mut out = self.out.take().ok_or_else(|| CoreError::Io("csv sink is closed".into()))?;
         out.flush()?;
-        let counting = out.into_inner().map_err(|e| CoreError::Io(e.to_string()))?;
+        let encoder = out.into_inner().map_err(|e| CoreError::Io(e.to_string()))?;
+        let (counting, unmappable) = encoder.finish()?;
+        self.unmappable = unmappable;
         let own = counting.bytes();
         let writer = counting.into_inner();
         match self.finisher.take() {
@@ -243,7 +285,7 @@ impl<W: Write + Send> Sink for CsvSink<W> {
         match self.close() {
             Ok(bytes) => {
                 self.final_bytes = Some(bytes);
-                Ok(SinkReport { rows: self.rows, bytes, files: vec![self.path.clone()] })
+                Ok(SinkReport { rows: self.rows, bytes, files: vec![self.path.clone()], unmappable_chars: self.unmappable })
             }
             Err(e) => {
                 // `close` still holds the writer only when `begin` failed; drop it so the file
@@ -307,5 +349,35 @@ mod tests {
         assert_eq!(delimiter_byte(&CsvOpts { delimiter: String::new(), ..CsvOpts::default() }).unwrap(), b',');
         assert!(delimiter_byte(&CsvOpts { delimiter: "│".into(), ..CsvOpts::default() }).is_err());
         assert!(delimiter_byte(&CsvOpts { delimiter: "\"".into(), ..CsvOpts::default() }).is_err());
+    }
+
+    fn euc_kr(delimiter: &str) -> CsvOpts {
+        CsvOpts { delimiter: delimiter.into(), encoding: Some(CsvEncoding::EucKr), ..CsvOpts::default() }
+    }
+
+    #[test]
+    fn letter_delimiters_are_rejected_for_euc_kr_only() {
+        for d in [",", ";", "\t", "|"] {
+            assert!(CsvSink::<Vec<u8>>::validate(&euc_kr(d)).is_ok(), "{d:?}");
+        }
+        for d in ["a", "Z"] {
+            let err = CsvSink::<Vec<u8>>::validate(&euc_kr(d)).unwrap_err();
+            assert_eq!(err.code(), "INVALID", "{d:?}");
+            assert!(check_encoding(&CsvOpts { delimiter: d.into(), ..CsvOpts::default() }).is_ok(), "UTF-8 allows {d:?}");
+        }
+    }
+
+    #[test]
+    fn euc_kr_report_counts_unmappable_characters() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![Some("한글"), Some("🚀🎉"), None]))]).unwrap();
+        let mut sink = Box::new(CsvSink::new(Vec::<u8>::new(), PathBuf::from("mem.csv"), CsvOpts { bom: true, ..euc_kr(",") }));
+        sink.write(Batch::Arrow(rb)).unwrap();
+        assert_eq!(sink.unmappable_chars(), 2, "flushed after each batch");
+        let rep = sink.finish().unwrap();
+        assert_eq!(rep.unmappable_chars, 2);
+        // `s` LF, CP949 "한글" (4 bytes) LF, `??` LF, `""` LF (a lone empty field is quoted);
+        // no BOM for EUC-KR although `bom` is set.
+        assert_eq!(rep.bytes, 2 + 5 + 3 + 3);
     }
 }

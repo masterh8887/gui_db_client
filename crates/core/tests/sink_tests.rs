@@ -1,11 +1,13 @@
 //! Sink stack tests: CSV (Arrow and raw paths), split, compression, Parquet, abort, empty
-//! results and the overwrite guard. Everything runs on the filesystem via `tempfile`.
+//! results, the overwrite guard and the EUC-KR (CP949) output encoding. Everything runs on the
+//! filesystem via `tempfile`.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use arrow_array::{Array, RecordBatch};
+use bulk_core::encoding::{self, Charset};
 use bulk_core::sink::compress::CompressWriter;
 use bulk_core::sink::csv::CsvSink;
 use bulk_core::sink::parquet::ParquetSink;
@@ -14,7 +16,7 @@ use bulk_core::sink::{self, Sink, SinkTarget};
 use bulk_core::source::arrow_batch::{schema_from, ArrowBatcher, Cell, ColKind};
 use bulk_core::source::Batch;
 use bulk_core::testdata::{self, Lcg, NASTY_COLUMNS};
-use bulk_core::types::{Compression, CsvOpts, OutputFormat, OutputOpts, ParquetCompression, ParquetOpts, SplitOpts};
+use bulk_core::types::{Compression, CsvEncoding, CsvOpts, OutputFormat, OutputOpts, ParquetCompression, ParquetOpts, SplitOpts};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -58,7 +60,7 @@ fn target(dir: &Path, stem: &str, opts: OutputOpts) -> SinkTarget {
 }
 
 fn csv_opts(header: bool, delimiter: &str, null_as: &str, bom: bool, crlf: bool) -> CsvOpts {
-    CsvOpts { header, delimiter: delimiter.into(), null_as: null_as.into(), bom, crlf }
+    CsvOpts { header, delimiter: delimiter.into(), null_as: null_as.into(), bom, crlf, encoding: None }
 }
 
 fn output(csv: CsvOpts) -> OutputOpts {
@@ -1114,4 +1116,295 @@ fn successful_finish_after_split_keeps_final_names() {
     let rep = sink.finish().unwrap();
     assert_eq!(rep.files, vec![dir.path().join("f1.csv"), dir.path().join("f2.csv")]);
     assert_eq!(dir_names(dir.path()), vec!["f1.csv", "f2.csv"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// (k) output encoding: EUC-KR (CP949)
+// ---------------------------------------------------------------------------------------------
+
+/// CP949 bytes of "한글".
+const HANGUL_CP949: &[u8] = b"\xC7\xD1\xB1\xDB";
+
+fn euc_kr_opts(bom: bool) -> CsvOpts {
+    CsvOpts { encoding: Some(CsvEncoding::EucKr), ..csv_opts(true, ",", "", bom, false) }
+}
+
+/// What an EUC-KR file holds for `s` (every character CP949 cannot represent becomes '?') and
+/// how many characters were replaced.
+fn cp949_view(s: &str) -> (String, u64) {
+    let mut out = String::with_capacity(s.len());
+    let mut replaced = 0;
+    for c in s.chars() {
+        if encoding::first_unmappable(Charset::EucKr, c.encode_utf8(&mut [0u8; 4])).is_some() {
+            out.push('?');
+            replaced += 1;
+        } else {
+            out.push(c);
+        }
+    }
+    (out, replaced)
+}
+
+/// The nasty rows as an EUC-KR file holds them, plus the total number of replaced characters.
+fn cp949_rows(rows: &[Vec<Option<String>>]) -> (Vec<Vec<Option<String>>>, u64) {
+    let mut total = 0;
+    let view = rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|c| {
+                    c.as_ref().map(|s| {
+                        let (v, n) = cp949_view(s);
+                        total += n;
+                        v
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    (view, total)
+}
+
+/// Strict CP949 decode of a whole file.
+fn decode_cp949(bytes: &[u8]) -> String {
+    let (text, had_errors) = encoding_rs::EUC_KR.decode_without_bom_handling(bytes);
+    assert!(!had_errors, "the file is valid CP949");
+    text.into_owned()
+}
+
+fn gunzip(path: &Path) -> Vec<u8> {
+    let mut back = Vec::new();
+    flate2::read::GzDecoder::new(File::open(path).unwrap()).read_to_end(&mut back).unwrap();
+    back
+}
+
+#[test]
+fn euc_kr_arrow_path_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = nasty_rows(500);
+    let t = target(dir.path(), "kr", output(euc_kr_opts(true)));
+    let mut sink = sink::build(&t).unwrap();
+    for rb in nasty_batches(&rows, 64) {
+        sink.write(Batch::Arrow(rb)).unwrap();
+    }
+    let rep = sink.finish().unwrap();
+    assert_eq!(rep.rows, 500);
+    let bytes = std::fs::read(&rep.files[0]).unwrap();
+    assert_eq!(rep.bytes, bytes.len() as u64, "counters see encoded bytes");
+    assert!(bytes.starts_with(b"id,text,"), "no BOM for EUC-KR even with bom = true");
+    assert!(std::str::from_utf8(&bytes).is_err(), "the file is not UTF-8");
+    assert!(bytes.windows(4).any(|w| w == HANGUL_CP949), "Hangul written as CP949");
+
+    let (want, replaced) = cp949_rows(&rows);
+    assert!(replaced > 0, "the nasty data holds emoji and accented Latin letters");
+    assert_eq!(rep.unmappable_chars, replaced);
+    let text = decode_cp949(&bytes);
+    let (header, got) = read_csv_bytes(text.as_bytes(), b',');
+    assert_eq!(header, NASTY_COLUMNS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert_rows_match(&want, &got, "");
+    // Every Hangul value survives the round trip, decoded the way a source decodes a cell.
+    let mut scratch = String::new();
+    let decoded = encoding::decode_cell(Charset::EucKr, &bytes, &mut scratch);
+    assert!(!decoded.replaced);
+    assert!(decoded.text.contains("한글 텍스트"));
+    // Export verification recounts CP949 files byte-wise (quoted newlines included).
+    assert_eq!(bulk_core::export::count_csv_rows(&rep.files[0], &euc_kr_opts(true)).unwrap(), 500);
+}
+
+#[test]
+fn euc_kr_raw_csv_path_chunks_split_inside_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = "번호,이름,메모\n";
+    let mut body = String::new();
+    for i in 0..200 {
+        body.push_str(&format!("{i},\"김철수, {i}\",\"줄1\n줄2 🚀\"\n"));
+    }
+    let t = target(dir.path(), "raw", output(euc_kr_opts(false)));
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::RawCsvHeader(Bytes::from(header))).unwrap();
+    // Odd chunk sizes: boundaries fall inside the 3-byte Hangul and the 4-byte emoji sequences.
+    let raw = body.as_bytes();
+    let (mut pos, mut k) = (0usize, 0usize);
+    while pos < raw.len() {
+        let len = [7usize, 1, 2, 13, 5][k % 5].min(raw.len() - pos);
+        sink.write(Batch::RawCsv { data: Bytes::copy_from_slice(&raw[pos..pos + len]), rows: 0 }).unwrap();
+        pos += len;
+        k += 1;
+    }
+    let rep = sink.finish().unwrap();
+    let bytes = std::fs::read(&rep.files[0]).unwrap();
+    let (view, replaced) = cp949_view(&format!("{header}{body}"));
+    let (want, _, err) = encoding_rs::EUC_KR.encode(&view);
+    assert!(!err);
+    assert_eq!(bytes, want.as_ref(), "byte-exact CP949 output");
+    assert_eq!(replaced, 200);
+    assert_eq!(rep.unmappable_chars, 200);
+    assert_eq!(rep.bytes, bytes.len() as u64);
+    assert_eq!(bulk_core::export::count_csv_rows(&rep.files[0], &euc_kr_opts(false)).unwrap(), 200);
+    let (h, got) = read_csv_bytes(decode_cp949(&bytes).as_bytes(), b',');
+    assert_eq!(h, vec!["번호", "이름", "메모"]);
+    assert_eq!(got[7], vec!["7".to_string(), "김철수, 7".to_string(), "줄1\n줄2 ?".to_string()]);
+}
+
+#[test]
+fn euc_kr_split_and_gzip_on_the_arrow_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = nasty_rows(10);
+    let opts = OutputOpts {
+        csv: Some(euc_kr_opts(true)),
+        compress: Some(Compression::Gzip),
+        split: Some(SplitOpts { rows: Some(4), megabytes: None }),
+        ..OutputOpts::default()
+    };
+    let t = target(dir.path(), "kg", opts);
+    let mut sink = sink::build(&t).unwrap();
+    for rb in nasty_batches(&rows, 3) {
+        sink.write(Batch::Arrow(rb)).unwrap();
+    }
+    let rep = sink.finish().unwrap();
+    assert_eq!(rep.files.len(), 3);
+    let (want, replaced) = cp949_rows(&rows);
+    assert_eq!(rep.unmappable_chars, replaced, "summed over the parts");
+    let mut all = Vec::new();
+    for p in &rep.files {
+        assert!(p.to_string_lossy().ends_with(".csv.gz"));
+        let back = gunzip(p);
+        assert!(back.starts_with(b"id,text,"), "header, no BOM, in {}", p.display());
+        let (_, got) = read_csv_bytes(decode_cp949(&back).as_bytes(), b',');
+        all.extend(got);
+    }
+    assert_rows_match(&want, &all, "");
+}
+
+#[test]
+fn euc_kr_split_and_gzip_on_the_raw_csv_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let header = Bytes::from("번호,이름\n");
+    let lines: Vec<String> = (0..10).map(|i| format!("{i},한글 {i} 🚀\n")).collect();
+    let opts = OutputOpts {
+        csv: Some(euc_kr_opts(false)),
+        compress: Some(Compression::Gzip),
+        split: Some(SplitOpts { rows: Some(4), megabytes: None }),
+        ..OutputOpts::default()
+    };
+    let t = target(dir.path(), "rg", opts);
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::RawCsvHeader(header)).unwrap();
+    sink.write(Batch::RawCsv { data: Bytes::from(lines[..7].concat()), rows: 7 }).unwrap();
+    sink.write(Batch::RawCsv { data: Bytes::from(lines[7..].concat()), rows: 3 }).unwrap();
+    let rep = sink.finish().unwrap();
+    assert_eq!(rep.rows, 10);
+    assert_eq!(rep.files.len(), 3);
+    assert_eq!(rep.unmappable_chars, 10, "one emoji per row, summed over the parts");
+    for (i, p) in rep.files.iter().enumerate() {
+        let text = decode_cp949(&gunzip(p));
+        let want = format!("번호,이름\n{}", lines[i * 4..((i + 1) * 4).min(10)].concat().replace('🚀', "?"));
+        assert_eq!(text, want, "part {}", i + 1);
+    }
+}
+
+#[test]
+fn euc_kr_replaces_characters_outside_cp949() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new("이름🚀", arrow_schema::DataType::Utf8, true)]));
+    let values = arrow_array::StringArray::from(vec![Some("aกb"), Some("🚀"), Some("한"), None, Some("똠방각하")]);
+    let rb = RecordBatch::try_new(schema, vec![std::sync::Arc::new(values)]).unwrap();
+    let t = target(dir.path(), "outside", output(CsvOpts { null_as: "NULL".into(), ..euc_kr_opts(false) }));
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::Arrow(rb)).unwrap();
+    let rep = sink.finish().unwrap();
+    assert_eq!(rep.unmappable_chars, 3, "the emoji in the header, Thai ko kai, the emoji in a cell");
+    let (name, _, e1) = encoding_rs::EUC_KR.encode("이름");
+    let (ddom, _, e2) = encoding_rs::EUC_KR.encode("똠방각하");
+    assert!(!e1 && !e2, "both are CP949 (똠 only in the UHC extension)");
+    let mut want = name.into_owned();
+    want.extend_from_slice(b"?\na?b\n?\n");
+    want.extend_from_slice(&HANGUL_CP949[..2]);
+    want.extend_from_slice(b"\nNULL\n");
+    want.extend_from_slice(&ddom);
+    want.push(b'\n');
+    assert_eq!(std::fs::read(&rep.files[0]).unwrap(), want);
+    let note = encoding::unmappable_note(rep.unmappable_chars, CsvEncoding::EucKr).unwrap();
+    assert!(note.starts_with("3 character(s)"), "{note}");
+}
+
+#[test]
+fn euc_kr_never_writes_a_bom() {
+    let dir = tempfile::tempdir().unwrap();
+    // Empty Arrow result: header only, no BOM, although `bom` is set.
+    let t = target(dir.path(), "empty", output(euc_kr_opts(true)));
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::Arrow(nasty_batches(&nasty_rows(1), 1).remove(0).slice(0, 0))).unwrap();
+    let rep = sink.finish().unwrap();
+    assert_eq!(std::fs::read(&rep.files[0]).unwrap(), b"id,text,num,note,flag,unicode\n");
+    // Raw path with a header: no BOM either.
+    let t = target(dir.path(), "rawbom", output(euc_kr_opts(true)));
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::RawCsvHeader(Bytes::from_static(b"a,b\n"))).unwrap();
+    sink.write(Batch::RawCsv { data: Bytes::from("1,한글\n"), rows: 1 }).unwrap();
+    let rep = sink.finish().unwrap();
+    let mut want = b"a,b\n1,".to_vec();
+    want.extend_from_slice(HANGUL_CP949);
+    want.push(b'\n');
+    assert_eq!(std::fs::read(&rep.files[0]).unwrap(), want);
+    // The same options in UTF-8 do write the BOM.
+    let t = target(dir.path(), "utf8bom", output(CsvOpts { encoding: Some(CsvEncoding::Utf8), ..euc_kr_opts(true) }));
+    let mut sink = sink::build(&t).unwrap();
+    sink.write(Batch::RawCsvHeader(Bytes::from_static(b"a,b\n"))).unwrap();
+    let rep = sink.finish().unwrap();
+    assert_eq!(std::fs::read(&rep.files[0]).unwrap(), b"\xEF\xBB\xBFa,b\n");
+    assert_eq!(rep.unmappable_chars, 0);
+}
+
+#[test]
+fn euc_kr_rejects_a_letter_delimiter_at_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = target(dir.path(), "x", output(CsvOpts { delimiter: "x".into(), ..euc_kr_opts(false) }));
+    assert_eq!(sink::build(&t).err().map(|e| e.code()), Some("INVALID"));
+    let t = target(dir.path(), "x", output(CsvOpts { delimiter: ";".into(), ..euc_kr_opts(false) }));
+    assert!(sink::build(&t).is_ok());
+}
+
+#[test]
+fn utf8_output_counts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = nasty_rows(50);
+    let t = target(dir.path(), "u", output(csv_opts(true, ",", "", false, false)));
+    let mut sink = sink::build(&t).unwrap();
+    for rb in nasty_batches(&rows, 16) {
+        sink.write(Batch::Arrow(rb)).unwrap();
+    }
+    let rep = sink.finish().unwrap();
+    assert_eq!(rep.unmappable_chars, 0, "UTF-8 is lossless");
+    let (_, got) = read_csv(&rep.files[0], b',');
+    assert_rows_match(&rows, &got, "");
+}
+
+#[test]
+fn csv_encoding_wire_values_and_defaults() {
+    let base = r#"{"header":true,"delimiter":",","nullAs":"","bom":true,"crlf":false"#;
+    // Absent = UTF-8 (older UIs and saved requests), and absent again on the way out.
+    let o: CsvOpts = serde_json::from_str(&format!("{base}}}")).unwrap();
+    assert_eq!((o.encoding, o.effective_encoding()), (None, CsvEncoding::Utf8));
+    assert!(o.writes_bom());
+    assert!(!serde_json::to_string(&o).unwrap().contains("encoding"));
+    for (wire, want) in [
+        ("utf-8", CsvEncoding::Utf8),
+        ("utf8", CsvEncoding::Utf8),
+        ("UTF-8", CsvEncoding::Utf8),
+        ("euc-kr", CsvEncoding::EucKr),
+        ("euckr", CsvEncoding::EucKr),
+        ("cp949", CsvEncoding::EucKr),
+        ("EUC-KR", CsvEncoding::EucKr),
+    ] {
+        let o: CsvOpts = serde_json::from_str(&format!(r#"{base},"encoding":"{wire}"}}"#)).unwrap();
+        assert_eq!(o.encoding, Some(want), "{wire}");
+        assert_eq!(o.writes_bom(), want == CsvEncoding::Utf8, "{wire}");
+    }
+    assert!(serde_json::from_str::<CsvOpts>(&format!(r#"{base},"encoding":"sjis"}}"#)).is_err());
+    let o = CsvOpts { encoding: Some(CsvEncoding::EucKr), ..CsvOpts::default() };
+    assert!(serde_json::to_string(&o).unwrap().contains(r#""encoding":"euc-kr""#));
+    assert_eq!(CsvEncoding::EucKr.as_str(), "euc-kr");
+    assert_eq!(CsvEncoding::Utf8.as_str(), "utf-8");
+    assert_eq!(CsvEncoding::default(), CsvEncoding::Utf8);
 }

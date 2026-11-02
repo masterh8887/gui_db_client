@@ -13,7 +13,7 @@ import type {
   LogEvent,
 } from 'ipc-types';
 import { create } from 'zustand';
-import { jobCancel, jobGet, jobList, jobResume } from '@/lib/commands';
+import { jobCancel, jobGet, jobList, jobResume, windowClaimJob } from '@/lib/commands';
 
 export const ACTIVE_STATES: readonly JobState[] = ['pending', 'preflight', 'warned', 'running', 'finishing'];
 export const TERMINAL_STATES: readonly JobState[] = ['done', 'cancelled', 'failed', 'rejected'];
@@ -44,6 +44,15 @@ export interface JobsState {
   /** Job ids in first-seen order. */
   order: string[];
   loaded: boolean;
+  /**
+   * Jobs this window started or was handed (`jobs:claimed`): their completion toasts show here
+   * (docs/db-copy.md 1.1). Jobs are process-global; every window lists every job.
+   */
+  local: Record<string, true>;
+  /** This window started `jobId`: remember it and claim it in the shell (`window_claim_job`). */
+  markLocal(jobId: string): void;
+  /** Jobs of a closed window handed to this one (`jobs:claimed`). */
+  addLocal(jobIds: string[]): void;
 
   /** Store a `job_get` / `job_list` snapshot; a stale one never moves the state back (see `mergeSnapshot`). */
   upsertSummary(summary: JobSummary): void;
@@ -130,6 +139,18 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
   jobs: {},
   order: [],
   loaded: false,
+  local: {},
+
+  markLocal: (jobId) => {
+    set((s) => ({ local: { ...s.local, [jobId]: true } }));
+    void windowClaimJob(jobId).catch(() => undefined);
+  },
+  addLocal: (jobIds) =>
+    set((s) => {
+      const local = { ...s.local };
+      for (const id of jobIds) local[id] = true;
+      return { local };
+    }),
 
   upsertSummary: (snapshot) =>
     set((s) => {
@@ -302,3 +323,32 @@ export function selectLastResult(s: JobsState): JobEntry | undefined {
   return selectRecentResults(s, 1)[0];
 }
 
+
+/** Jobs of one connection, in first-seen order (use with `useShallow`). */
+export function selectJobsForConn(s: JobsState, connId: string | null): JobEntry[] {
+  if (!connId) return [];
+  return selectAllJobs(s).filter((e) => e.summary.connId === connId);
+}
+
+/** Priority of an active state for the global job indicator (higher first). */
+const PRIMARY_RANK: Partial<Record<JobState, number>> = { warned: 5, running: 4, finishing: 3, preflight: 2, pending: 1 };
+
+/**
+ * The active job the JobChip / pill show: warned > running > finishing > preflight > pending;
+ * among equals the most recently seen job.
+ */
+export function selectPrimaryActiveJob(s: JobsState, connId?: string | null): JobEntry | undefined {
+  let best: JobEntry | undefined;
+  let bestRank = 0;
+  for (const id of s.order) {
+    const e = s.jobs[id];
+    if (!e) continue;
+    if (connId !== undefined && connId !== null && e.summary.connId !== connId) continue;
+    const rank = PRIMARY_RANK[e.summary.state] ?? 0;
+    if (rank > 0 && rank >= bestRank) {
+      best = e;
+      bestRank = rank;
+    }
+  }
+  return best;
+}

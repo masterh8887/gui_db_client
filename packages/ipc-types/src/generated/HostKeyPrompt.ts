@@ -4,4 +4,12 @@ export type HostKeyPrompt = { promptId: string, host: string, fingerprint: strin
 /**
  * The raw ssh message, for the dialog.
  */
-message: string, };
+message: string, 
+/**
+ * Connection whose tunnel asks (context for prompts raised in another window).
+ */
+connName?: string, 
+/**
+ * Label of the job that opened the tunnel, when a job did.
+ */
+jobLabel?: string, };

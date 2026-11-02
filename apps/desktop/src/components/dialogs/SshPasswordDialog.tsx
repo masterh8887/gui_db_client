@@ -1,23 +1,32 @@
 'use client';
 
-// `tunnel:password`: ssh asks for a password or key passphrase. Sent once, never stored.
+// `tunnel:password` (DESIGN.md §5.I "Prompts"): ssh asks for a password or key passphrase. Sent
+// once, never stored. Esc, scrim and 취소 send the cancel answer (`tunnel_provide_secret` without
+// a secret); the prompt is resolved in `finally`. Queue: oldest first.
 
+import type { SshPasswordPrompt } from 'ipc-types';
 import { useState } from 'react';
 import { tunnelProvideSecret } from '@/lib/commands';
-import { t } from '@/lib/i18n';
 import { errorText } from '@/lib/ipc-error';
-import { Button, Dialog, Field, Input } from '@/components/ui';
+import { Button, Field, Input, Sheet } from '@/components/ui';
 import { logLocal } from '@/stores/logs';
 import { useUiStore } from '@/stores/ui';
+import { promptContext } from './promptContext';
+import { sp } from './SshPasswordDialog.strings';
 
 export function SshPasswordDialog() {
   const prompt = useUiStore((s) => s.sshPasswordPrompts[0]);
-  const resolve = useUiStore((s) => s.resolveSshPasswordPrompt);
+  if (!prompt) return null;
+  // Keyed so every prompt starts with an empty field.
+  return <SshPasswordSheet key={prompt.promptId} prompt={prompt} />;
+}
+
+function SshPasswordSheet({ prompt }: { prompt: SshPasswordPrompt }) {
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState(false);
-  if (!prompt) return null;
 
   const submit = async (value: string | undefined) => {
+    if (busy) return;
     setBusy(true);
     try {
       await tunnelProvideSecret(prompt.promptId, value);
@@ -26,25 +35,28 @@ export function SshPasswordDialog() {
     } finally {
       setSecret('');
       setBusy(false);
-      resolve(prompt.promptId);
+      useUiStore.getState().resolveSshPasswordPrompt(prompt.promptId);
     }
   };
 
-  const label = t(prompt.kind === 'passphrase' ? 'sshpw.passphrase' : 'sshpw.password', { user: prompt.user, host: prompt.host });
+  const label = sp(prompt.kind === 'passphrase' ? 'passphrase' : 'password', { user: prompt.user, host: prompt.host });
   return (
-    <Dialog
+    <Sheet
       open
-      onOpenChange={(o) => !o && void submit(undefined)}
-      title={t('sshpw.title')}
       width="sm"
-      modal
+      title={sp('title')}
+      description={promptContext(prompt.connName, prompt.jobLabel)}
+      dismissible={!busy}
+      onOpenChange={(o) => {
+        if (!o) void submit(undefined);
+      }}
       footer={
         <>
-          <Button variant="ghost" onClick={() => void submit(undefined)} disabled={busy}>
-            {t('common.cancel')}
+          <Button variant="secondary" onClick={() => void submit(undefined)} disabled={busy}>
+            {sp('cancel')}
           </Button>
           <Button variant="primary" onClick={() => void submit(secret)} loading={busy} disabled={!secret}>
-            {t('sshpw.submit')}
+            {sp('submit')}
           </Button>
         </>
       }
@@ -55,10 +67,10 @@ export function SshPasswordDialog() {
           if (secret) void submit(secret);
         }}
       >
-        <Field label={label} htmlFor="ssh-secret" hint={t('sshpw.hint')}>
+        <Field label={label} htmlFor="ssh-secret" hint={sp('hint')}>
           <Input id="ssh-secret" type="password" autoComplete="off" autoFocus value={secret} onChange={(e) => setSecret(e.target.value)} />
         </Field>
       </form>
-    </Dialog>
+    </Sheet>
   );
 }

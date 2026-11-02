@@ -41,3 +41,10 @@ pub fn default_library_dirs() -> Vec<PathBuf> {
     }
     dirs
 }
+
+/// Start a child that outlives this process in its own process group (a terminal Ctrl+C that
+/// stops this process never reaches it).
+pub fn detach(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}

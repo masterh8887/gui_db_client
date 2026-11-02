@@ -23,3 +23,8 @@ async-trait = { workspace = true }
 memory-stats = { workspace = true }
 chrono = { workspace = true }
 rpassword = "7"
+
+[dev-dependencies]
+# Test fixtures only (both already in Cargo.lock).
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

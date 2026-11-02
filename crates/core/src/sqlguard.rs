@@ -584,6 +584,102 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     split_with(sql, LEX_STANDARD)
 }
 
+/// [`split_statements`] with the lexing rules of `dialect` (`Any` uses the standard rules) that
+/// keeps a routine or trigger body together: in a statement that starts `CREATE [OR REPLACE]
+/// [DEFINER = …] [TEMP] [CONSTRAINT] [AGGREGATE] TRIGGER | FUNCTION | PROCEDURE | EVENT`, a `;`
+/// inside a `BEGIN … END` block (SQLite and MySQL trigger bodies, MySQL compound statements,
+/// PostgreSQL `BEGIN ATOMIC`) does not end the statement. `CASE … END` nests like a block;
+/// MySQL's `END IF | LOOP | WHILE | REPEAT` close constructs that never opened one. Any other
+/// statement splits exactly like [`split_statements`]. Used by the copy target's statement
+/// guard, whose statements come from catalog definitions (docs/db-copy.md 5.2).
+pub fn split_statements_compound(sql: &str, dialect: Dialect) -> Vec<String> {
+    let lex = if dialect == Dialect::MySql { LEX_MYSQL } else { LEX_STANDARD };
+    let bytes = sql.as_bytes();
+    let mut pieces: Vec<&str> = Vec::new();
+    let mut piece_start = 0;
+    // Per statement: leading words (to recognise a routine / trigger), block depth.
+    let mut lead: Vec<String> = Vec::new();
+    let mut paren_seen = false;
+    let mut compound: Option<bool> = None;
+    let mut depth: i32 = 0;
+    let mut last_end = false;
+    for span in scan(sql, lex) {
+        if span.region != Region::Code {
+            continue;
+        }
+        let mut i = span.start;
+        while i < span.end {
+            let c = bytes[i];
+            if is_ident_byte(c) && !c.is_ascii_digit() {
+                let start = i;
+                while i < span.end && is_ident_byte(bytes[i]) {
+                    i += 1;
+                }
+                let w = sql[start..i].to_ascii_uppercase();
+                if compound.is_none() {
+                    if !paren_seen && lead.len() < 8 {
+                        lead.push(w.clone());
+                    }
+                    compound = compound_kind(&lead, paren_seen);
+                }
+                if compound == Some(true) {
+                    if last_end && matches!(w.as_str(), "IF" | "LOOP" | "WHILE" | "REPEAT") {
+                        // `END IF` and friends: undo the decrement of that END.
+                        depth += 1;
+                    } else if last_end && w == "CASE" {
+                        // `END CASE`: the END already closed the CASE.
+                    } else if matches!(w.as_str(), "BEGIN" | "CASE") {
+                        depth += 1;
+                    } else if w == "END" {
+                        depth -= 1;
+                    }
+                    last_end = w == "END";
+                }
+                continue;
+            }
+            if c == b'(' {
+                paren_seen = true;
+            }
+            if c == b';' && (compound != Some(true) || depth <= 0) {
+                pieces.push(&sql[piece_start..i]);
+                piece_start = i + 1;
+                lead.clear();
+                paren_seen = false;
+                compound = None;
+                depth = 0;
+                last_end = false;
+            } else if !c.is_ascii_whitespace() {
+                last_end = false;
+            }
+            i += 1;
+        }
+    }
+    pieces.push(&sql[piece_start..]);
+    pieces.into_iter().map(str::trim).filter(|p| !strip_with(p, lex).trim().is_empty()).map(|p| p.to_string()).collect()
+}
+
+/// Whether the leading words decide a routine / trigger statement: `Some(true)` for `CREATE`,
+/// optional modifiers, then `TRIGGER | FUNCTION | PROCEDURE | EVENT`; `Some(false)` as soon as
+/// another word (or a parenthesis) shows it is not one; `None` while undecided.
+fn compound_kind(lead: &[String], paren_seen: bool) -> Option<bool> {
+    let first = lead.first()?;
+    if first != "CREATE" || paren_seen {
+        return Some(false);
+    }
+    for w in &lead[1..] {
+        match w.as_str() {
+            "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT" => return Some(true),
+            "OR" | "REPLACE" | "DEFINER" | "CURRENT_USER" | "TEMP" | "TEMPORARY" | "CONSTRAINT" | "AGGREGATE" => {}
+            _ => return Some(false),
+        }
+    }
+    if lead.len() >= 8 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// [`split_statements`] for one set of lexing rules.
 fn split_with(sql: &str, lex: Lexer) -> Vec<String> {
     let bytes = sql.as_bytes();
@@ -958,6 +1054,38 @@ mod tests {
     fn scanner_keeps_semicolons_inside_quotes() {
         let sql = "select 'a;b', \"c;d\", `e;f`, [g;h], $$i;j$$, $t$k;l$t$ from t -- ;\n/* ; /* ; */ */;";
         assert_eq!(split_statements(sql).len(), 1);
+    }
+
+    #[test]
+    fn compound_bodies_stay_one_statement() {
+        let one = |sql: &str, d: Dialect| assert_eq!(split_statements_compound(sql, d).len(), 1, "{sql}");
+        let two = |sql: &str, d: Dialect| assert_eq!(split_statements_compound(sql, d).len(), 2, "{sql}");
+        // SQLite trigger bodies, with a CASE expression in the WHEN clause.
+        one("CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN SELECT 1; END", Dialect::Standard);
+        one("CREATE TEMP TRIGGER IF NOT EXISTS tr AFTER UPDATE ON t WHEN (CASE WHEN new.a THEN 1 END) BEGIN UPDATE x SET a = 1; DELETE FROM y; END;", Dialect::Standard);
+        // MySQL compound bodies: nested blocks, END IF / LOOP / CASE, labels, strings with `;`.
+        one(
+            "CREATE DEFINER=`root`@`localhost` TRIGGER `db`.`tg` BEFORE INSERT ON `db`.`t` FOR EACH ROW BEGIN\n  DECLARE n INT;\n  IF NEW.a > 0 THEN SET NEW.b = 'x;\\'y'; END IF;\n  lbl: LOOP LEAVE lbl; END LOOP lbl;\n  CASE NEW.c WHEN 1 THEN SET NEW.d = 2; ELSE BEGIN END; END CASE;\nEND",
+            Dialect::MySql,
+        );
+        one("CREATE TRIGGER `tg` BEFORE INSERT ON `t` FOR EACH ROW SET NEW.a = NEW.a + 1", Dialect::MySql);
+        // PostgreSQL SQL-standard bodies and dollar-quoted bodies.
+        one(
+            "CREATE OR REPLACE FUNCTION \"app\".\"f\"(a integer) RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT CASE WHEN a > 0 THEN 1 END; SELECT 2; END",
+            Dialect::Standard,
+        );
+        one("CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$", Dialect::Standard);
+        // A second statement after the body still splits; other statements split as before.
+        two("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END; DROP TABLE x", Dialect::Standard);
+        two("CREATE TABLE t (event int, begin int); DROP TABLE x", Dialect::Standard);
+        two("CREATE VIEW v AS SELECT 1; SELECT 2", Dialect::MySql);
+        two("BEGIN; COMMIT", Dialect::Standard);
+        assert_eq!(
+            split_statements_compound("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END", Dialect::Standard)[0],
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END"
+        );
+        // MySQL lexing: a backslash-escaped quote does not end the string.
+        one("INSERT INTO `t` VALUES ('a\\';b')", Dialect::MySql);
     }
 
     #[test]

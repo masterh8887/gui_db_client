@@ -42,7 +42,7 @@ use super::arrow_batch::{days_from_date, micros_from_naive, micros_from_time, sc
 use super::{Batch, ConnectParams, Database, Query, Source, SourceStream, SslMode};
 use crate::error::{CoreError, Result};
 use crate::types::{PlanNode, PlanSummary, PlanWarning, ServerInfo, SessionOpts, Severity, TableRef};
-use crate::{BATCH_BYTES, BATCH_ROWS};
+use crate::BATCH_ROWS;
 
 // ---------------------------------------------------------------------------------------------
 // Transport
@@ -499,6 +499,7 @@ async fn pump(
     tx: &mpsc::Sender<Result<Batch>>,
     ready: &mut Option<oneshot::Sender<Result<SchemaRef>>>,
     max_rows: usize,
+    max_bytes: usize,
 ) -> Result<()> {
     let mut stream = client.query(sql, &[]).await.map_err(map_err)?;
     let mut batcher: Option<ArrowBatcher> = None;
@@ -523,7 +524,7 @@ async fn pump(
                 let cols: Vec<(String, ColKind)> = meta.columns().iter().map(|c| (c.name().to_string(), col_kind(c.column_type()))).collect();
                 let schema = schema_from(&cols);
                 let kinds = cols.iter().map(|(_, k)| *k).collect();
-                batcher = Some(ArrowBatcher::with_limits(schema.clone(), kinds, max_rows, BATCH_BYTES));
+                batcher = Some(ArrowBatcher::with_limits(schema.clone(), kinds, max_rows, max_bytes));
                 if let Some(r) = ready.take() {
                     let _ = r.send(Ok(schema));
                 }
@@ -653,6 +654,7 @@ impl Source for MssqlDatabase {
         let slot = self.slot.clone();
         let sql = q.sql.clone();
         let max_rows = opts.fetch_batch_rows.map(|n| n as usize).filter(|n| *n > 0).unwrap_or(BATCH_ROWS).min(BATCH_ROWS);
+        let max_bytes = q.batch_bytes();
         let timeout = opts.statement_timeout_ms.filter(|ms| *ms > 0).map(Duration::from_millis);
         let (tx, rx) = mpsc::channel::<Result<Batch>>(2);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SchemaRef>>();
@@ -660,7 +662,7 @@ impl Source for MssqlDatabase {
         tokio::spawn(async move {
             let mut ready = Some(ready_tx);
             let outcome: Result<()> = {
-                let work = AssertUnwindSafe(pump(&mut client, &sql, &tx, &mut ready, max_rows)).catch_unwind();
+                let work = AssertUnwindSafe(pump(&mut client, &sql, &tx, &mut ready, max_rows, max_bytes)).catch_unwind();
                 let deadline = async {
                     match timeout {
                         Some(d) => tokio::time::sleep(d).await,
@@ -710,7 +712,7 @@ impl Source for MssqlDatabase {
             Err(_) => return Err(CoreError::Cancelled),
         };
         let stream = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        Ok(SourceStream { schema: Some(schema), stream: Box::pin(stream) })
+        Ok(SourceStream { schema: Some(schema), stream: Box::pin(stream), replaced: None })
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<Option<PlanSummary>> {
@@ -752,6 +754,10 @@ impl Source for MssqlDatabase {
 
     fn session_id(&self) -> Option<String> {
         self.slot.session_id.read().unwrap().clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn driver_id(&self) -> &'static str {

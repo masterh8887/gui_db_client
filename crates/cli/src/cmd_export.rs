@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use bulk_core::types::{
-    Compression, Connection, CsvOpts, ExportRequest, JobState, OutputFormat, OutputOpts, ParquetOpts, PreflightReport, SessionOpts, Settings, SplitOpts,
+    Compression, Connection, CsvEncoding, CsvOpts, ExportRequest, JobState, OutputFormat, OutputOpts, ParquetOpts, PreflightReport, SessionOpts, Settings, SplitOpts,
 };
 use bulk_core::BulkDb;
 
-use crate::args::ExportArgs;
+use crate::args::{EncodingArg, ExportArgs};
 use crate::connect::{self, path_string};
 use crate::output::{enum_name, eprint_issues, fmt_duration_ms, human_bytes, human_count, human_rate, opt_bytes, opt_count, print_json};
 use crate::progress::{wait_for_job, WaitOptions, WaitOutcome};
@@ -159,6 +159,9 @@ pub fn build_request(args: &ExportArgs, conn: &Connection, settings: &Settings, 
     if format == OutputFormat::Parquet && compress.is_some() {
         bail!("--compress / .gz / .zst apply to CSV only; parquet uses --parquet-compression");
     }
+    if format == OutputFormat::Parquet && args.encoding == Some(EncodingArg::EucKr) {
+        bail!("--encoding euc-kr applies to CSV only; parquet is always UTF-8");
+    }
 
     let csv = if format == OutputFormat::Csv {
         let delimiter = match &args.delimiter {
@@ -173,7 +176,13 @@ pub fn build_request(args: &ExportArgs, conn: &Connection, settings: &Settings, 
         } else {
             args.excel || settings.csv_crlf_default
         };
-        Some(CsvOpts { header: !args.no_header, delimiter, null_as: args.null.clone().unwrap_or_default(), bom: args.bom || args.excel, crlf })
+        // A BOM is UTF-8 only: an explicit `--bom` with euc-kr is a contradiction, while the
+        // `--excel` preset keeps bom = true and the core skips it (`CsvOpts::writes_bom`).
+        let encoding = args.encoding.map(|e| e.to_core());
+        if args.bom && encoding == Some(CsvEncoding::EucKr) {
+            bail!("--bom writes a UTF-8 byte order mark; it cannot be combined with --encoding euc-kr");
+        }
+        Some(CsvOpts { header: !args.no_header, delimiter, null_as: args.null.clone().unwrap_or_default(), bom: args.bom || args.excel, crlf, encoding })
     } else {
         None
     };
@@ -506,5 +515,38 @@ mod tests {
         assert_eq!(req.output.dir, "C:/exports");
         assert_eq!(req.output.name_pattern, OutputOpts::default().name_pattern);
         assert_eq!(req.session.work_mem.as_deref(), Some("32MB"));
+    }
+
+    #[test]
+    fn encoding_flag_and_bom_rules() {
+        fn build(extra: &[&str]) -> anyhow::Result<ExportRequest> {
+            let mut argv = vec!["--query", "select 1"];
+            argv.extend_from_slice(extra);
+            build_request(&export_args(&argv), &conn(), &settings(), &SqlSource::Inline("select 1".into()), None)
+        }
+        // Default: no encoding on the wire (= UTF-8).
+        let csv = build(&["--out", "o/x.csv"]).unwrap().output.csv.unwrap();
+        assert_eq!((csv.encoding, csv.effective_encoding()), (None, CsvEncoding::Utf8));
+        for alias in ["euc-kr", "euckr", "cp949"] {
+            let csv = build(&["--out", "o/x.csv", "--encoding", alias]).unwrap().output.csv.unwrap();
+            assert_eq!(csv.encoding, Some(CsvEncoding::EucKr), "{alias}");
+            assert!(!csv.writes_bom());
+        }
+        for alias in ["utf-8", "utf8"] {
+            let csv = build(&["--out", "o/x.csv", "--encoding", alias, "--bom"]).unwrap().output.csv.unwrap();
+            assert_eq!(csv.encoding, Some(CsvEncoding::Utf8), "{alias}");
+            assert!(csv.writes_bom());
+        }
+        // --bom contradicts euc-kr; --excel keeps its preset and simply writes no BOM.
+        let err = build(&["--out", "o/x.csv", "--encoding", "euc-kr", "--bom"]).unwrap_err().to_string();
+        assert!(err.contains("--bom") && err.contains("euc-kr"), "{err}");
+        let req = build(&["--out", "o/x.csv", "--encoding", "euc-kr", "--excel"]).unwrap();
+        let csv = req.output.csv.unwrap();
+        assert!(csv.bom && csv.crlf && !csv.writes_bom());
+        assert_eq!(req.output.split.unwrap().rows, Some(1_000_000));
+        // Parquet is always UTF-8.
+        assert!(build(&["--out", "o/x.parquet", "--encoding", "euc-kr"]).is_err());
+        assert!(build(&["--out", "o/x.parquet", "--encoding", "utf-8"]).is_ok());
+        assert!(Cli::try_parse_from(["bulk-cli", "export", "--driver", "sqlite", "--path", "t.db", "--query", "select 1", "--encoding", "sjis"]).is_err());
     }
 }

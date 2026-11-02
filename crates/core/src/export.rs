@@ -106,6 +106,9 @@ pub fn build_target(req: &ExportRequest, conn: &Connection, settings: &Settings,
         if csv.delimiter.len() != 1 {
             return Err(CoreError::Invalid(format!("CSV delimiter must be a single byte, got {:?}", csv.delimiter)));
         }
+        // Output encoding vs delimiter (a letter cannot delimit CP949 text); the NULL text is
+        // a preflight blocker (`preflight::check_output_encoding`).
+        sink::csv::check_encoding(&csv)?;
         opts.csv = Some(csv);
     } else {
         opts.compress = None;
@@ -510,7 +513,7 @@ async fn run_export_inner(bulk: &Arc<BulkDb>, job: &Arc<JobEntry>, req: &ExportR
     cancellable(&cancel, live.apply_session(&session)).await?;
     let output = stream_output(live.source(), &prep.target);
     let raw_csv = matches!(output, StreamOutput::RawCsv(_));
-    let query = Query { sql: statement, output };
+    let query = Query::new(statement, output);
     tracing::info!(job_id = %job.id, raw_csv, target = %prep.target.path_for(0).display(), "starting query");
     // The driver got the token: awaited (not raced) so a cancel while the server is still
     // planning or sorting reaches the server through the driver's own cancel path.
@@ -539,6 +542,10 @@ async fn run_export_inner(bulk: &Arc<BulkDb>, job: &Arc<JobEntry>, req: &ExportR
     job.progress.set_phase(JobPhase::Finishing);
     drop(live);
     let (bytes_on_disk, mut notes) = verify_outputs(&written)?;
+    if let Some(note) = prep.target.opts.csv.as_ref().and_then(|c| crate::encoding::unmappable_note(written.unmappable_chars, c.effective_encoding())) {
+        tracing::warn!(job_id = %job.id, unmappable = written.unmappable_chars, "{note}");
+        notes.push(note);
+    }
     let mut verified_rows = None;
     if bulk.settings_get().verify_after_export && can_recount_csv(&prep.target) {
         let counted = if cancel.is_cancelled() {
@@ -853,13 +860,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.csv");
         std::fs::write(&p, b"12345").unwrap();
-        let ok = SinkReport { rows: 1, bytes: 5, files: vec![p.clone()] };
+        let ok = SinkReport { rows: 1, bytes: 5, files: vec![p.clone()], unmappable_chars: 0 };
         assert_eq!(verify_outputs(&ok).unwrap(), (5, vec![]));
-        let off = SinkReport { rows: 1, bytes: 9, files: vec![p.clone()] };
+        let off = SinkReport { rows: 1, bytes: 9, files: vec![p.clone()], unmappable_chars: 0 };
         let (bytes, notes) = verify_outputs(&off).unwrap();
         assert_eq!(bytes, 5);
         assert_eq!(notes.len(), 1);
-        let missing = SinkReport { rows: 1, bytes: 5, files: vec![dir.path().join("nope.csv")] };
+        let missing = SinkReport { rows: 1, bytes: 5, files: vec![dir.path().join("nope.csv")], unmappable_chars: 0 };
         assert!(matches!(verify_outputs(&missing), Err(CoreError::Io(_))));
     }
 

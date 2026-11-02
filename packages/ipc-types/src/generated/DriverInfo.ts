@@ -13,7 +13,13 @@ installUrl?: string,
 /**
  * Plain-text install instruction (e.g. a package-manager command); never a link.
  */
-installHint?: string, fields: Array<string>, defaults: { [key in string]?: string }, sessionOpts: Array<string>, 
+installHint?: string, fields: Array<string>, defaults: { [key in string]?: string }, 
+/**
+ * Allowed values of enumerated fields (registry `choices`), e.g. MySQL
+ * `protocol: [auto, modern, legacy]`; the connection form renders these as a select.
+ * Absent when the driver has no enumerated field.
+ */
+choices?: { [key in string]?: Array<string> }, sessionOpts: Array<string>, 
 /**
  * Installed ODBC driver names (ODBC tier only).
  */

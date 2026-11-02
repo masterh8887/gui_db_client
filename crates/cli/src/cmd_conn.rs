@@ -33,8 +33,16 @@ pub async fn run(db: &Arc<BulkDb>, args: ConnArgs, json: bool) -> anyhow::Result
                 print_conn_details(&c);
             }
         }
-        ConnCmd::Add(a) => add(db, &a, json)?,
-        ConnCmd::Edit(a) => edit(db, &a, json)?,
+        ConnCmd::Add(a) => {
+            if let Some(code) = add(db, &a, json)? {
+                return Ok(code);
+            }
+        }
+        ConnCmd::Edit(a) => {
+            if let Some(code) = edit(db, &a, json)? {
+                return Ok(code);
+            }
+        }
         ConnCmd::Delete { conn, yes } => {
             let c = connect::find_saved(db, &conn)?;
             if !yes && !json {
@@ -84,6 +92,7 @@ pub async fn run(db: &Arc<BulkDb>, args: ConnArgs, json: bool) -> anyhow::Result
             } else {
                 let mut t = Table::new(&[
                     ("NAME", Align::Left),
+                    ("TAG", Align::Left),
                     ("DRIVER", Align::Left),
                     ("HOST", Align::Left),
                     ("PORT", Align::Right),
@@ -94,7 +103,17 @@ pub async fn run(db: &Arc<BulkDb>, args: ConnArgs, json: bool) -> anyhow::Result
                 ]);
                 for ic in &imported {
                     let c = &ic.connection;
-                    t.row(vec![c.name.clone(), c.driver.clone(), opt(&c.host), opt(&c.port), opt(&c.database), opt(&c.user), ssh_label(c), ic.notes.join("; ")]);
+                    t.row(vec![
+                        c.name.clone(),
+                        opt(&c.tag),
+                        c.driver.clone(),
+                        opt(&c.host),
+                        opt(&c.port),
+                        opt(&c.database),
+                        opt(&c.user),
+                        ssh_label(c),
+                        ic.notes.join("; "),
+                    ]);
                 }
                 t.print();
                 if save {
@@ -116,7 +135,7 @@ pub async fn run(db: &Arc<BulkDb>, args: ConnArgs, json: bool) -> anyhow::Result
 
 /// `conn add`: refuses a name that is already saved unless `--replace` asks to overwrite
 /// that connection (same id, so its history and session defaults stay).
-fn add(db: &BulkDb, a: &ConnAddArgs, json: bool) -> anyhow::Result<()> {
+fn add(db: &BulkDb, a: &ConnAddArgs, json: bool) -> anyhow::Result<Option<ExitCode>> {
     let name = a.name.trim();
     if name.is_empty() {
         bail!("--name must not be empty");
@@ -136,6 +155,7 @@ fn add(db: &BulkDb, a: &ConnAddArgs, json: bool) -> anyhow::Result<()> {
             }
             conn.id = existing.id.clone();
             conn.session = existing.session.clone();
+            conn.tag = existing.tag;
             Some(existing.clone())
         }
         Some(existing) => {
@@ -146,27 +166,64 @@ fn add(db: &BulkDb, a: &ConnAddArgs, json: bool) -> anyhow::Result<()> {
             .into());
         }
     };
+    if let Some(tag) = a.tag {
+        conn.tag = Some(tag.into());
+    }
     conn.save_password = !a.no_save_password;
     let keeps_password = replaced.as_ref().map(|c| c.save_password && c.has_password).unwrap_or(false);
     let password = if conn.save_password { db_password(&a.adhoc, &conn, &drivers, keeps_password)? } else { None };
     // Secrets of a connection that asks every time are never stored, so do not ask for them.
     let (ssh_password, ssh_key_passphrase) = if conn.save_password { ssh_secrets(&a.adhoc, &conn)? } else { (None, None) };
-    let saved = db.conn_save(ConnectionInput { connection: conn, password, ssh_password, ssh_key_passphrase, ..Default::default() }).context("saving the connection")?;
+    if a.write_allowed == Some(true) && !confirm_write_allowed(&conn, a.yes)? {
+        eprintln!("--write-allowed true on the production connection '{}' needs a confirmation: answer on a terminal or add --yes", conn.name);
+        return Ok(Some(ExitCode::from(crate::EXIT_CONFIRM)));
+    }
+    // A new connection never starts write-allowed (core ignores `true` on a new id); the flag
+    // is set by a second save of the existing id.
+    conn.write_allowed = None;
+    let mut saved =
+        db.conn_save(ConnectionInput { connection: conn, password, ssh_password, ssh_key_passphrase, ..Default::default() }).context("saving the connection")?;
+    if let Some(w) = a.write_allowed {
+        let mut again = saved.clone();
+        again.write_allowed = Some(w);
+        saved = db.conn_save(ConnectionInput { connection: again, ..Default::default() }).context("saving the write permission")?;
+    }
     if json {
         print_json(&saved)?;
     } else {
         let verb = if replaced.is_some() { "replaced" } else { "saved" };
-        println!("{verb} connection '{}' ({}) for driver {}", saved.name, saved.id, saved.driver);
+        println!("{verb} connection '{}' ({}) for driver {}{}", saved.name, saved.id, saved.driver, tag_suffix(&saved));
+        if saved.write_allowed == Some(true) {
+            println!("DB copy may write into '{}' (write-allowed)", saved.name);
+        }
         note_missing_password(&saved, &drivers);
     }
-    Ok(())
+    Ok(None)
+}
+
+/// `--write-allowed true` on a production-tagged connection: `--yes`, or a yes on the terminal.
+fn confirm_write_allowed(conn: &Connection, yes: bool) -> anyhow::Result<bool> {
+    if conn.tag != Some(bulk_core::types::ConnTag::Production) || yes {
+        return Ok(true);
+    }
+    if !prompts::is_interactive() {
+        return Ok(false);
+    }
+    Ok(prompts::confirm(&format!("'{}' is tagged production. Allow DB copy to write into it? [y/N] ", conn.name))?)
 }
 
 /// `conn edit`: apply the given flags to a saved connection and save it under the same id.
-fn edit(db: &BulkDb, a: &ConnEditArgs, json: bool) -> anyhow::Result<()> {
+fn edit(db: &BulkDb, a: &ConnEditArgs, json: bool) -> anyhow::Result<Option<ExitCode>> {
     let existing = connect::find_saved(db, &a.conn)?;
     let drivers = db.drivers_list();
-    let conn = apply_edit(&existing, a, &drivers)?;
+    let mut conn = apply_edit(&existing, a, &drivers)?;
+    // Only an explicit --write-allowed sends the flag: absent keeps the stored value, and an
+    // endpoint change clears it unless this edit sends true.
+    conn.write_allowed = a.write_allowed;
+    if a.write_allowed == Some(true) && existing.write_allowed != Some(true) && !confirm_write_allowed(&conn, a.yes)? {
+        eprintln!("--write-allowed true on the production connection '{}' needs a confirmation: answer on a terminal or add --yes", conn.name);
+        return Ok(Some(ExitCode::from(crate::EXIT_CONFIRM)));
+    }
     if conn.name != existing.name {
         if let Some(other) = find_by_name(&db.conn_list(), &conn.name, Some(&existing.id)) {
             return Err(CoreError::Invalid(format!("a connection named '{}' already exists ({}); pick another --name", other.name, other.id)).into());
@@ -222,13 +279,18 @@ fn edit(db: &BulkDb, a: &ConnEditArgs, json: bool) -> anyhow::Result<()> {
     }
 
     let clears = a.clear_password || a.clear_ssh_secret;
-    if conn == existing && password.is_none() && ssh_password.is_none() && ssh_key_passphrase.is_none() && !clears {
+    let unchanged = {
+        let mut same = conn.clone();
+        same.write_allowed = same.write_allowed.or(existing.write_allowed);
+        same == existing
+    };
+    if unchanged && password.is_none() && ssh_password.is_none() && ssh_key_passphrase.is_none() && !clears {
         if json {
             print_json(&existing)?;
         } else {
             println!("no changes to connection '{}' ({})", existing.name, existing.id);
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let input = ConnectionInput { connection: conn, password, ssh_password, ssh_key_passphrase, clear_password: a.clear_password, clear_ssh_secret: a.clear_ssh_secret };
@@ -236,16 +298,29 @@ fn edit(db: &BulkDb, a: &ConnEditArgs, json: bool) -> anyhow::Result<()> {
     if json {
         print_json(&saved)?;
     } else {
-        println!("updated connection '{}' ({}) for driver {}", saved.name, saved.id, saved.driver);
+        println!("updated connection '{}' ({}) for driver {}{}", saved.name, saved.id, saved.driver, tag_suffix(&saved));
+        if a.clear_tag {
+            println!("{}", if existing.tag.is_some() { "removed the environment tag" } else { "no environment tag to remove" });
+        }
         if a.clear_password {
             println!("{}", if existing.has_password { "removed the stored password" } else { "no stored password to remove" });
         }
         if a.clear_ssh_secret {
             println!("{}", if existing.has_ssh_secret { "removed the stored SSH secret" } else { "no stored SSH secret to remove" });
         }
+        if saved.write_allowed != existing.write_allowed {
+            println!(
+                "{}",
+                if saved.write_allowed == Some(true) {
+                    "DB copy may now write into this connection (write-allowed)"
+                } else {
+                    "DB copy may no longer write into this connection"
+                }
+            );
+        }
         note_missing_password(&saved, &drivers);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Hint for a connection that should store a password but has none.
@@ -255,10 +330,16 @@ fn note_missing_password(saved: &Connection, drivers: &[DriverInfo]) {
     }
 }
 
+/// `" [production]"` for a tagged connection, empty otherwise.
+fn tag_suffix(c: &Connection) -> String {
+    c.tag.map(|t| format!(" [{t}]")).unwrap_or_default()
+}
+
 fn print_conn_table(list: &[Connection]) {
     let mut t = Table::new(&[
         ("ID", Align::Left),
         ("NAME", Align::Left),
+        ("TAG", Align::Left),
         ("DRIVER", Align::Left),
         ("HOST", Align::Left),
         ("PORT", Align::Right),
@@ -266,12 +347,26 @@ fn print_conn_table(list: &[Connection]) {
         ("USER", Align::Left),
         ("SSH", Align::Left),
         ("PASSWORD", Align::Left),
+        ("WRITE", Align::Left),
         ("OUTPUT DIR", Align::Left),
     ]);
     for c in list {
         let host = c.host.clone().or_else(|| c.fields.get("path").cloned()).unwrap_or_else(|| "-".into());
         let password = if !c.save_password { "ask".to_string() } else { yes_no(c.has_password).to_string() };
-        t.row(vec![c.id.clone(), c.name.clone(), c.driver.clone(), host, opt(&c.port), opt(&c.database), opt(&c.user), ssh_label(c), password, opt(&c.output_dir)]);
+        t.row(vec![
+            c.id.clone(),
+            c.name.clone(),
+            opt(&c.tag),
+            c.driver.clone(),
+            host,
+            opt(&c.port),
+            opt(&c.database),
+            opt(&c.user),
+            ssh_label(c),
+            password,
+            if c.write_allowed == Some(true) { "yes".to_string() } else { "-".to_string() },
+            opt(&c.output_dir),
+        ]);
     }
     t.print();
 }
@@ -280,6 +375,8 @@ fn print_conn_table(list: &[Connection]) {
 fn print_conn_details(c: &Connection) {
     kv("ID", &c.id);
     kv("Name", &c.name);
+    kv("Tag", opt(&c.tag));
+    kv("Write allowed", yes_no(c.write_allowed == Some(true)));
     kv("Driver", &c.driver);
     kv("Host", opt(&c.host));
     kv("Port", opt(&c.port));
@@ -395,9 +492,15 @@ mod tests {
     async fn edit_clears_exactly_the_requested_secret() {
         let dir = std::env::temp_dir().join(format!("bulk-cli-unit-{}-clear-secrets", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = BulkDb::new(BulkDbOptions { config_dir: Some(dir.clone()), prompts: None, credentials: Some(Box::new(MemoryStore::default())), init_logging: false })
-            .await
-            .unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.clone()),
+            prompts: None,
+            credentials: Some(Box::new(MemoryStore::default())),
+            init_logging: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
         let ssh = SshConfig { enabled: true, host: "bastion".into(), port: 22, user: "deploy".into(), auth: SshAuth::Password, key_path: None, compression: true };
         let conn = Connection { name: "pg".into(), driver: "postgres".into(), host: Some("db".into()), ssh: Some(ssh), save_password: true, ..Default::default() };
         let saved = db.conn_save(ConnectionInput { connection: conn, password: Some("pw".into()), ssh_password: Some("sp".into()), ..Default::default() }).unwrap();

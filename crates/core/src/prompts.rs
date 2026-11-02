@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::error::{CoreError, Result};
 use crate::tunnel::PromptHandler;
-use crate::types::{CoreEvent, HostKeyPrompt, SshPasswordPrompt};
+use crate::types::{CoreEvent, HostKeyPrompt, PromptResolved, SshPasswordPrompt};
 
 /// Default time the user gets to answer a prompt before the tunnel gives up.
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -82,7 +82,12 @@ impl EventPromptHandler {
         match pending.get(prompt_id) {
             None => Err(CoreError::NotFound(format!("tunnel prompt {prompt_id}"))),
             Some(p) if p.kind() != kind => Err(CoreError::Invalid(format!("prompt {prompt_id} is a {} prompt, not a {kind} prompt", p.kind()))),
-            Some(_) => Ok(pending.remove(prompt_id).expect("checked above")),
+            Some(_) => {
+                let p = pending.remove(prompt_id).expect("checked above");
+                drop(pending);
+                self.resolved(prompt_id);
+                Ok(p)
+            }
         }
     }
 
@@ -94,8 +99,30 @@ impl EventPromptHandler {
         self.pending.lock().unwrap().insert(id.to_string(), p);
     }
 
+    /// Remove a pending prompt (timeout, dropped waiter); emits `PromptResolved` when it was
+    /// still pending.
     fn forget(&self, id: &str) {
-        self.pending.lock().unwrap().remove(id);
+        let removed = self.pending.lock().unwrap().remove(id).is_some();
+        if removed {
+            self.resolved(id);
+        }
+    }
+
+    /// Every removal of a pending prompt ends here: every window closes its dialog for it.
+    fn resolved(&self, id: &str) {
+        let _ = self.events.send(CoreEvent::PromptResolved(PromptResolved { prompt_id: id.to_string() }));
+    }
+}
+
+/// Forgets the prompt when the waiting future is dropped (a cancelled tunnel attempt).
+struct ForgetOnDrop<'a> {
+    handler: &'a EventPromptHandler,
+    id: String,
+}
+
+impl Drop for ForgetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.handler.forget(&self.id);
     }
 }
 
@@ -106,6 +133,7 @@ impl PromptHandler for EventPromptHandler {
         prompt.prompt_id = id.clone();
         let (tx, rx) = oneshot::channel();
         self.register(&id, Pending::HostKey(tx));
+        let _guard = ForgetOnDrop { handler: self, id: id.clone() };
         let host = prompt.host.clone();
         if self.events.send(CoreEvent::TunnelHostKey(prompt)).is_err() {
             self.forget(&id);
@@ -130,6 +158,7 @@ impl PromptHandler for EventPromptHandler {
         prompt.prompt_id = id.clone();
         let (tx, rx) = oneshot::channel();
         self.register(&id, Pending::Secret(tx));
+        let _guard = ForgetOnDrop { handler: self, id: id.clone() };
         let (host, user, kind) = (prompt.host.clone(), prompt.user.clone(), prompt.kind.clone());
         if self.events.send(CoreEvent::TunnelPassword(prompt)).is_err() {
             self.forget(&id);
@@ -156,7 +185,15 @@ mod tests {
     use std::sync::Arc;
 
     fn prompt() -> HostKeyPrompt {
-        HostKeyPrompt { prompt_id: String::new(), host: "bastion".into(), fingerprint: "SHA256:abc".into(), key_type: Some("ED25519".into()), message: "?".into() }
+        HostKeyPrompt {
+            prompt_id: String::new(),
+            host: "bastion".into(),
+            fingerprint: "SHA256:abc".into(),
+            key_type: Some("ED25519".into()),
+            message: "?".into(),
+            conn_name: None,
+            job_label: None,
+        }
     }
 
     #[tokio::test]
@@ -181,8 +218,10 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8);
         let h = Arc::new(EventPromptHandler::new(tx));
         let h2 = h.clone();
-        let waiter =
-            tokio::spawn(async move { h2.ssh_secret(SshPasswordPrompt { prompt_id: String::new(), host: "b".into(), user: "u".into(), kind: "password".into() }).await });
+        let waiter = tokio::spawn(async move {
+            h2.ssh_secret(SshPasswordPrompt { prompt_id: String::new(), host: "b".into(), user: "u".into(), kind: "password".into(), conn_name: None, job_label: None })
+                .await
+        });
         let CoreEvent::TunnelPassword(p) = rx.recv().await.unwrap() else { panic!("expected password event") };
         h.provide_secret(&p.prompt_id, None).unwrap();
         assert_eq!(waiter.await.unwrap().unwrap(), None);
@@ -199,5 +238,41 @@ mod tests {
         let (tx, _) = broadcast::channel(8);
         let h = EventPromptHandler::new(tx);
         assert!(matches!(h.host_key(prompt()).await, Err(CoreError::Tunnel(_))));
+    }
+
+    /// Every removal emits `PromptResolved`: an answer, a timeout and a dropped waiter.
+    #[tokio::test]
+    async fn every_removal_emits_prompt_resolved() {
+        async fn resolved(rx: &mut broadcast::Receiver<CoreEvent>) -> String {
+            loop {
+                if let CoreEvent::PromptResolved(r) = rx.recv().await.unwrap() {
+                    return r.prompt_id;
+                }
+            }
+        }
+        // Timeout.
+        let (tx, mut rx) = broadcast::channel(8);
+        let h = EventPromptHandler::with_timeout(tx, Duration::from_millis(30));
+        assert!(h.host_key(prompt()).await.is_err());
+        let CoreEvent::TunnelHostKey(p) = rx.recv().await.unwrap() else { panic!("expected hostkey event") };
+        assert_eq!(resolved(&mut rx).await, p.prompt_id);
+
+        // Answer.
+        let (tx, mut rx) = broadcast::channel(8);
+        let h = Arc::new(EventPromptHandler::new(tx));
+        let h2 = h.clone();
+        let waiter = tokio::spawn(async move { h2.host_key(prompt()).await });
+        let CoreEvent::TunnelHostKey(p) = rx.recv().await.unwrap() else { panic!("expected hostkey event") };
+        h.confirm_hostkey(&p.prompt_id, false).unwrap();
+        assert_eq!(resolved(&mut rx).await, p.prompt_id);
+        assert!(!waiter.await.unwrap().unwrap());
+
+        // Dropped waiter (cancelled tunnel attempt).
+        let h2 = h.clone();
+        let waiter = tokio::spawn(async move { h2.host_key(prompt()).await });
+        let CoreEvent::TunnelHostKey(p) = rx.recv().await.unwrap() else { panic!("expected hostkey event") };
+        waiter.abort();
+        assert_eq!(resolved(&mut rx).await, p.prompt_id);
+        assert!(h.pending_ids().is_empty());
     }
 }
