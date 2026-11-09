@@ -83,6 +83,8 @@ export const qs = defineStrings('query', {
     splitRows: 'rows per file',
     splitMb: 'MB per file',
     overwrite: 'Overwrite existing files',
+    xlsxOptions: 'XLSX',
+    xlsxNotPg: 'XLSX requires typed data; not available for PostgreSQL (use CSV or Parquet)',
     excelPreset: 'Excel preset',
     excelPresetHint: 'CSV, UTF-8 BOM, CRLF, split every 1,000,000 rows',
 
@@ -263,6 +265,8 @@ export const qs = defineStrings('query', {
     splitRows: '파일당 행 수',
     splitMb: '파일당 MB',
     overwrite: '기존 파일 덮어쓰기',
+    xlsxOptions: 'XLSX',
+    xlsxNotPg: 'XLSX는 타입 데이터가 필요합니다. PostgreSQL은 지원하지 않습니다 (CSV 또는 Parquet 사용)',
     excelPreset: 'Excel 프리셋',
     excelPresetHint: 'CSV, UTF-8 BOM, CRLF, 1,000,000행마다 분할',
 

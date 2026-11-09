@@ -247,6 +247,7 @@ pub enum OutputFormat {
     #[default]
     Csv,
     Parquet,
+    Xlsx,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -347,6 +348,25 @@ fn default_row_group_mb() -> u32 {
     128
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct XlsxOpts {
+    /// Write a bold header row. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub header: bool,
+    /// Sheet name. Defaults to `"Sheet1"`.
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet_name: Option<String>,
+}
+
+impl Default for XlsxOpts {
+    fn default() -> Self {
+        XlsxOpts { header: true, sheet_name: None }
+    }
+}
+
 impl Default for ParquetOpts {
     fn default() -> Self {
         ParquetOpts { compression: ParquetCompression::Zstd, row_group_mb: 128 }
@@ -400,6 +420,10 @@ pub struct OutputOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split: Option<SplitOpts>,
     #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xlsx: Option<XlsxOpts>,
+    #[serde(default)]
     pub overwrite: bool,
 }
 
@@ -415,6 +439,7 @@ impl Default for OutputOpts {
             format: OutputFormat::Csv,
             csv: Some(CsvOpts::default()),
             parquet: None,
+            xlsx: None,
             compress: None,
             split: None,
             overwrite: false,
@@ -1384,6 +1409,59 @@ pub enum CoreEvent {
     SettingsChanged(Settings),
     /// A tunnel prompt is gone (answered, timed out, forgotten or its waiter dropped).
     PromptResolved(PromptResolved),
+}
+
+// ---------------------------------------------------------------------------------------------
+// Script Mode
+// ---------------------------------------------------------------------------------------------
+
+/// Supported script runtimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptRuntime {
+    Node,
+    Python,
+    Bash,
+}
+
+/// Info about a detected runtime (returned by `script_detect_runtime`).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInfo {
+    pub runtime: ScriptRuntime,
+    pub version: String,
+    pub path: String,
+}
+
+/// Which output stream a `ScriptLine` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptStream {
+    Stdout,
+    Stderr,
+}
+
+/// One line of output from a running script.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptLine {
+    pub job_id: String,
+    pub stream: ScriptStream,
+    pub text: String,
+    pub ts: String,
+}
+
+/// Emitted when a script finishes (exit, error, or cancel).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptDone {
+    pub job_id: String,
+    #[serde(default)]
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+    pub duration_ms: u64,
 }
 
 /// Helper: now as RFC 3339 with milliseconds.

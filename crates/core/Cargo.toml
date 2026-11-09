@@ -66,6 +66,9 @@ encoding_rs = "0.8.42"
 # SHA-256 for copy plan ids and ack keys (docs/db-copy.md 2). Pinned to the version already in
 # Cargo.lock (no new crate).
 sha2 = "0.10.9"
+# Pure-Rust XLSX writer for the xlsx sink. Constant-memory mode (set_use_constant_memory) keeps
+# RSS proportional to one row rather than all rows. Pinned to the version in Cargo.lock.
+rust_xlsxwriter = { version = "0.80", features = ["constant_memory"] }
 
 [target.'cfg(windows)'.dependencies]
 odbc-api = { workspace = true, optional = true }

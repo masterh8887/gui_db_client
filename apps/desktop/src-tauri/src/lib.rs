@@ -24,6 +24,7 @@ pub fn run() {
         .on_menu_event(|app, event| menu::on_event(app, event.id().as_ref()))
         // Managed before the first window exists, so its focus events find the registry.
         .manage(windows::WindowRegistry::default())
+        .manage(commands::ScriptJobs::default())
         .on_window_event(windows::on_window_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -96,6 +97,10 @@ pub fn run() {
             commands::instances_info,
             commands::instance_spawn,
             commands::app_quit_confirmed,
+            commands::script_detect_runtime,
+            commands::script_install_runtime,
+            commands::script_run,
+            commands::script_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building BulkDB");

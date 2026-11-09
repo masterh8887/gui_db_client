@@ -8,14 +8,6 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
     css: false,
-    pool: 'forks',
-    poolOptions: {
-      forks: {
-        // Node >= 25 ships its own `localStorage` global, which shadows jsdom's and is undefined
-        // without `--localstorage-file`. Turn it off so tests see the browser's Storage.
-        execArgv: ['--no-experimental-webstorage'],
-      },
-    },
   },
   resolve: {
     alias: {

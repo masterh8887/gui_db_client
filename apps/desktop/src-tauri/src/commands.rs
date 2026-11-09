@@ -79,18 +79,29 @@
 //! `CONNECT, AUTH, QUERY, IO, CANCELLED, TIMEOUT, DRIVER_MISSING, OOM_RISK, INVALID, TUNNEL,
 //! NOT_FOUND, INTERNAL`.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bulk_core::sqlguard::SqlCheck;
 use bulk_core::types::*;
 use bulk_core::BulkDb;
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
 use tauri_plugin_opener::OpenerExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command as TokioCommand;
+use tokio_util::sync::CancellationToken;
 
 use crate::menu;
 use crate::state::{blocking, CmdError, CmdResult};
 use crate::windows::{self, WindowRegistry};
+
+// --------------------------------------------------------------------------------------- scripts
+
+/// In-process registry of running script jobs: job_id → cancellation token.
+#[derive(Default)]
+pub struct ScriptJobs(pub Mutex<HashMap<String, CancellationToken>>);
 
 /// Default page size for `history_list`.
 const DEFAULT_HISTORY_LIMIT: usize = 200;
@@ -449,6 +460,161 @@ pub async fn instance_spawn(svc: State<'_, Arc<BulkDb>>) -> CmdResult<()> {
 pub async fn app_quit_confirmed(app: AppHandle) -> CmdResult<()> {
     windows::confirm_quit(&app);
     Ok(())
+}
+
+// --------------------------------------------------------------------------------------- scripts
+
+/// Probe whether a runtime (node, python, bash) is installed; returns its version and path or
+/// `null` when not found.
+#[tauri::command]
+pub async fn script_detect_runtime(runtime: ScriptRuntime) -> CmdResult<Option<RuntimeInfo>> {
+    Ok(tokio::task::spawn_blocking(move || bulk_core::script::detect_runtime(runtime)).await.map_err(|e| CmdError::internal(format!("spawn_blocking: {e}")))?)
+}
+
+/// Kick off the OS package manager to install `runtime`. Streams output lines as `script:line`
+/// events and emits `script:done` on completion. Returns the job id immediately.
+#[tauri::command]
+pub async fn script_install_runtime(jobs: State<'_, ScriptJobs>, app: AppHandle, runtime: ScriptRuntime) -> CmdResult<String> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let args = bulk_core::script::install_command(runtime);
+    if args.is_empty() {
+        return Err(CmdError::new("INVALID", "no install command for this runtime", None));
+    }
+    let token = CancellationToken::new();
+    jobs.0.lock().unwrap().insert(job_id.clone(), token.clone());
+    let jid = job_id.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let mut cmd = TokioCommand::new(&args[0]);
+        cmd.args(&args[1..]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        let result = cmd.spawn();
+        match result {
+            Err(e) => {
+                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start: {e}"), ts: now_rfc3339() });
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
+            }
+            Ok(mut child) => {
+                stream_child(&app, &jid, &mut child, &token).await;
+                let exit = child.wait().await.ok();
+                let cancelled = token.is_cancelled();
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 });
+            }
+        }
+    });
+    Ok(job_id)
+}
+
+/// Run `script` using `runtime` with the connection's credentials injected as env vars.
+/// Streams stdout/stderr as `script:line` events and emits `script:done` when done.
+/// Returns the job id immediately (the caller supplies it so the UI can register the listener
+/// before the first line arrives).
+#[tauri::command]
+pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>, app: AppHandle, job_id: String, conn_id: String, runtime: ScriptRuntime, script: String) -> CmdResult<()> {
+    let env = blocking(&svc, move |db| db.conn_script_env(&conn_id)).await?;
+    let token = CancellationToken::new();
+    jobs.0.lock().unwrap().insert(job_id.clone(), token.clone());
+    let jid = job_id.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        // Write script to a temp file so multi-line scripts work without shell escaping.
+        let ext = match runtime { ScriptRuntime::Node => "js", ScriptRuntime::Python => "py", ScriptRuntime::Bash => "sh" };
+        let tmp = match tokio::task::spawn_blocking(move || {
+            let mut f = tempfile::Builder::new().suffix(&format!(".{ext}")).tempfile()?;
+            use std::io::Write;
+            f.write_all(script.as_bytes())?;
+            f.flush()?;
+            Ok::<_, std::io::Error>(f)
+        }).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to write script: {e}"), ts: now_rfc3339() });
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
+                return;
+            }
+            Err(e) => {
+                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("spawn error: {e}"), ts: now_rfc3339() });
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
+                return;
+            }
+        };
+        let (exe, extra_args) = bulk_core::script::runtime_args(runtime);
+        let script_path = tmp.path().to_string_lossy().into_owned();
+        let mut cmd = TokioCommand::new(exe);
+        cmd.args(extra_args).arg(&script_path).envs(&env).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        match cmd.spawn() {
+            Err(e) => {
+                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start {exe}: {e}"), ts: now_rfc3339() });
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
+            }
+            Ok(mut child) => {
+                stream_child(&app, &jid, &mut child, &token).await;
+                let exit = child.wait().await.ok();
+                let cancelled = token.is_cancelled();
+                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 });
+                drop(tmp);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Cancel a running script job by job id. No-op if the job is unknown or already finished.
+#[tauri::command]
+pub async fn script_cancel(jobs: State<'_, ScriptJobs>, job_id: String) -> CmdResult<()> {
+    if let Some(token) = jobs.0.lock().unwrap().remove(&job_id) {
+        token.cancel();
+    }
+    Ok(())
+}
+
+/// Drain both stdout and stderr of `child` into `script:line` events, stopping on cancellation.
+async fn stream_child(app: &AppHandle, job_id: &str, child: &mut tokio::process::Child, token: &CancellationToken) {
+    let stdout = child.stdout.take().map(BufReader::new);
+    let stderr = child.stderr.take().map(BufReader::new);
+
+    let app_out = app.clone();
+    let app_err = app.clone();
+    let jid_out = job_id.to_string();
+    let jid_err = job_id.to_string();
+    let token_out = token.clone();
+    let token_err = token.clone();
+
+    let out_task = tokio::spawn(async move {
+        let Some(mut reader) = stdout else { return };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            tokio::select! {
+                n = reader.read_line(&mut line) => {
+                    if n.ok() == Some(0) { break; }
+                    let text = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                    let _ = app_out.emit("script:line", ScriptLine { job_id: jid_out.clone(), stream: ScriptStream::Stdout, text, ts: now_rfc3339() });
+                }
+                _ = token_out.cancelled() => { break; }
+            }
+        }
+    });
+
+    let err_task = tokio::spawn(async move {
+        let Some(mut reader) = stderr else { return };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            tokio::select! {
+                n = reader.read_line(&mut line) => {
+                    if n.ok() == Some(0) { break; }
+                    let text = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                    let _ = app_err.emit("script:line", ScriptLine { job_id: jid_err.clone(), stream: ScriptStream::Stderr, text, ts: now_rfc3339() });
+                }
+                _ = token_err.cancelled() => { break; }
+            }
+        }
+    });
+
+    if token.is_cancelled() {
+        let _ = child.kill().await;
+    }
+    let _ = tokio::join!(out_task, err_task);
 }
 
 #[cfg(test)]

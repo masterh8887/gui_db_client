@@ -88,7 +88,7 @@ pub fn resolve_output_dir(req: &ExportRequest, conn: &Connection, settings: &Set
 pub fn effective_csv(opts: &OutputOpts, settings: &Settings) -> Option<CsvOpts> {
     match opts.format {
         OutputFormat::Csv => Some(opts.csv.clone().unwrap_or_else(|| CsvOpts { crlf: settings.csv_crlf_default, ..CsvOpts::default() })),
-        OutputFormat::Parquet => None,
+        OutputFormat::Parquet | OutputFormat::Xlsx => None,
     }
 }
 

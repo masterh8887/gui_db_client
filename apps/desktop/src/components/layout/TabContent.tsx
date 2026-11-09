@@ -7,12 +7,13 @@
 import { useShallow } from 'zustand/react/shallow';
 import { HistoryView } from '@/components/history/HistoryView';
 import { QueryTabView } from '@/components/query/QueryTabView';
+import { ScriptTabView } from '@/components/script/ScriptTabView';
 import { selectTabList, useTabsStore, type WorkspaceTab } from '@/stores/tabs';
 import { EmptyWorkspace } from './EmptyWorkspace';
 import { TableTabFrame } from './TableTabFrame';
 
 function keepMounted(tab: WorkspaceTab): boolean {
-  return tab.kind === 'query' || (tab.kind === 'table' && tab.view === 'query');
+  return tab.kind === 'query' || tab.kind === 'script' || (tab.kind === 'table' && tab.view === 'query');
 }
 
 export function TabContent({ connId }: { connId: string }) {
@@ -30,6 +31,8 @@ export function TabContent({ connId }: { connId: string }) {
               <QueryTabView tabId={tab.id} />
             ) : tab.kind === 'table' ? (
               <TableTabFrame tab={tab} />
+            ) : tab.kind === 'script' ? (
+              <ScriptTabView tabId={tab.id} />
             ) : (
               <HistoryView tabId={tab.id} connId={tab.connId} />
             )}

@@ -19,6 +19,7 @@ pub mod csv;
 pub mod naming;
 pub mod parquet;
 pub mod split;
+pub mod xlsx;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SinkReport {

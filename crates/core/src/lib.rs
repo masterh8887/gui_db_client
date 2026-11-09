@@ -34,6 +34,7 @@ pub mod prompts;
 pub mod service;
 pub mod sink;
 pub mod source;
+pub mod script;
 pub mod sqlguard;
 pub mod testdata;
 pub mod tunnel;

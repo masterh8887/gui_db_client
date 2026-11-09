@@ -4,10 +4,11 @@ import type { CsvOpts } from "./CsvOpts";
 import type { OutputFormat } from "./OutputFormat";
 import type { ParquetOpts } from "./ParquetOpts";
 import type { SplitOpts } from "./SplitOpts";
+import type { XlsxOpts } from "./XlsxOpts";
 
 export type OutputOpts = { dir: string, 
 /**
  * File name pattern without extension. Placeholders: `{conn}`, `{name}`, `{yyyyMMdd_HHmm}`,
  * `{yyyyMMdd}`, `{HHmmss}`. Extensions (`.csv`, `.parquet`, `.gz`, `.zst`, `_part0001`) are appended.
  */
-namePattern: string, format: OutputFormat, csv?: CsvOpts, parquet?: ParquetOpts, compress?: Compression, split?: SplitOpts, overwrite: boolean, };
+namePattern: string, format: OutputFormat, csv?: CsvOpts, parquet?: ParquetOpts, compress?: Compression, split?: SplitOpts, xlsx?: XlsxOpts, overwrite: boolean, };

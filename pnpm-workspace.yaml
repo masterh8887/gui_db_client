@@ -15,11 +15,19 @@ allowBuilds:
 # lands in the lockfile. Add new entries with `pnpm audit --ignore <GHSA>`, never by turning the
 # gate off.
 auditConfig:
-  ignoreGhsas:
-    # tinypool <2.1.2 prototype-pollution gadgets (critical). Reached only through
-    # apps/desktop > vitest@3 > tinypool@1.1.1: the dev-time unit-test runner, which never ships
-    # in the static export or the Tauri bundle and only runs our own test files. vitest 3 pins
-    # tinypool ^1; the patched tinypool 2.1.2 needs vitest >= 4.1.12 (which also clears the
-    # moderate GHSA-82fw-gwwq-j7x9 / GHSA-qxg6-89mg-rqv8). Drop both lines with that upgrade.
-    - GHSA-5gmw-xhrv-c9v3
-    - GHSA-85c8-ppgw-ccpr
+  ignoreGhsas: []
+
+minimumReleaseAgeExclude:
+  - "@next/env@16.4.5"
+  - "@next/eslint-plugin-next@16.4.5"
+  - "@next/swc-darwin-arm64@16.4.5"
+  - "@next/swc-darwin-x64@16.4.5"
+  - "@next/swc-linux-arm64-gnu@16.4.5"
+  - "@next/swc-linux-arm64-musl@16.4.5"
+  - "@next/swc-linux-x64-gnu@16.4.5"
+  - "@next/swc-linux-x64-musl@16.4.5"
+  - "@next/swc-win32-arm64-msvc@16.4.5"
+  - "@next/swc-win32-x64-msvc@16.4.5"
+  - eslint-config-next@16.4.5
+  - lucide-react@1.67.0
+  - next@16.4.5

@@ -80,6 +80,8 @@ describe('HostKeyDialog', () => {
     await act(() => new Promise((r) => setTimeout(r, 0)));
     const scrim = document.querySelector('.fixed.inset-0') ?? document.body;
     fireEvent.pointerDown(scrim);
+    fireEvent.pointerUp(scrim);
+    fireEvent.click(scrim);
     await waitFor(() => expect(tunnelConfirmHostkey).toHaveBeenCalledWith('p1', false));
   });
 

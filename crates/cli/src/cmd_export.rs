@@ -215,7 +215,7 @@ pub fn build_request(args: &ExportArgs, conn: &Connection, settings: &Settings, 
         sql_file,
         name: Some(label),
         session,
-        output: OutputOpts { dir, name_pattern, format, csv, parquet, compress, split, overwrite: args.overwrite },
+        output: OutputOpts { dir, name_pattern, format, csv, parquet, xlsx: None, compress, split, overwrite: args.overwrite },
         password,
     })
 }

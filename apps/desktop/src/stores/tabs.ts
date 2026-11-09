@@ -12,9 +12,10 @@ import { errorText } from '@/lib/ipc-error';
 import { canTargetTable } from '@/lib/table-target';
 import { useExtractStore, type QueryDoc, type QueryDocInit } from './extract';
 import { logLocal } from './logs';
+import { useScriptStore } from './script';
 import { ts } from './strings';
 
-export type TabKind = 'query' | 'table' | 'history';
+export type TabKind = 'query' | 'table' | 'history' | 'script';
 export type TableView = 'structure' | 'query';
 export type StructureSegment = 'columns' | 'indexes' | 'ddl' | 'overview';
 
@@ -43,7 +44,13 @@ export interface HistoryTab extends TabBase {
   kind: 'history';
 }
 
-export type WorkspaceTab = QueryTab | TableTab | HistoryTab;
+export interface ScriptTab extends TabBase {
+  kind: 'script';
+  /** Sequential number, same as QueryTab. */
+  seq: number;
+}
+
+export type WorkspaceTab = QueryTab | TableTab | HistoryTab | ScriptTab;
 
 export interface ClosedTab {
   tab: WorkspaceTab;
@@ -69,6 +76,7 @@ export interface TabsState {
   workspaceConnId: string | null;
 
   openQuery(connId: string, init?: QueryDocInit & { title?: string }): string;
+  openScript(connId: string): string;
   openTable(
     connId: string,
     table: TableRef,
@@ -154,7 +162,11 @@ export const useTabsStore = create<TabsState>()((set, get) => {
       tabs,
       sets: { ...s.sets, [connId]: { ids: remaining, activeId, closed: closed.slice(-CLOSED_LIMIT) } },
     });
-    for (const id of ids) extract.disposeDoc(id);
+    const script = useScriptStore.getState();
+    for (const id of ids) {
+      extract.disposeDoc(id);
+      if (s.tabs[id]?.kind === 'script') script.disposeDoc(id);
+    }
   };
 
   /** Create the Query-view doc of a table tab and fill it with the select-all SQL. */
@@ -199,6 +211,22 @@ export const useTabsStore = create<TabsState>()((set, get) => {
       const id = newId('q');
       const tab: QueryTab = { id, kind: 'query', connId, seq, customTitle: title?.trim() || undefined };
       useExtractStore.getState().createDoc(id, connId, docInit);
+      set((st) => ({ tabs: { ...st.tabs, [id]: tab } }));
+      putSet(connId, withInserted(getSet(connId), id, insertIndex(getSet(connId))));
+      return id;
+    },
+
+    openScript: (connId) => {
+      const cur = getSet(connId);
+      const s = get();
+      const seq =
+        cur.ids.reduce((max, id) => {
+          const tab = s.tabs[id];
+          return tab?.kind === 'query' || tab?.kind === 'script' ? Math.max(max, tab.seq) : max;
+        }, 0) + 1;
+      const id = newId('q');
+      const tab: ScriptTab = { id, kind: 'script', connId, seq };
+      useScriptStore.getState().createDoc(id, connId);
       set((st) => ({ tabs: { ...st.tabs, [id]: tab } }));
       putSet(connId, withInserted(getSet(connId), id, insertIndex(getSet(connId))));
       return id;
@@ -447,5 +475,7 @@ export function tabTitle(tab: WorkspaceTab, doc?: Pick<QueryDoc, 'name'>): strin
       return tab.table.name;
     case 'history':
       return ts('historyTitle');
+    case 'script':
+      return ts('queryTitle', { n: tab.seq });
   }
 }

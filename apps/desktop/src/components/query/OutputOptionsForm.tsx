@@ -7,13 +7,14 @@
 // EUC-KR disables the BOM (UTF-8 only); Parquet is always UTF-8.
 
 import type { Compression, CsvEncoding, OutputFormat, ParquetCompression } from 'ipc-types';
+import { useConnectionsStore } from '@/stores/connections';
 import { FileSpreadsheet, FolderOpen } from 'lucide-react';
 import { useId } from 'react';
 import { pickDirectory } from '@/lib/dialogs';
 import { num } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { Button, Checkbox, IconButton, Input, NumberInput, SegmentedControl, Select } from '@/components/ui';
-import { csvEncoding, defaultCsvOpts, defaultParquetOpts, useExtractStore, useQueryDoc } from '@/stores/extract';
+import { csvEncoding, defaultCsvOpts, defaultParquetOpts, defaultXlsxOpts, useExtractStore, useQueryDoc } from '@/stores/extract';
 import { FormRow } from './parts';
 import { qs } from './strings';
 
@@ -50,14 +51,17 @@ const encodingOptions = (disabled: boolean) => [
 export function OutputOptionsForm({ tabId }: { tabId: string }) {
   const uid = useId();
   const id = (k: string) => `${uid}-${k}`;
-  const doc = useQueryDoc(tabId, (d) => ({ output: d.output, name: d.name }));
+  const doc = useQueryDoc(tabId, (d) => ({ output: d.output, name: d.name, connId: d.connId }));
   if (!doc) return null;
-  const { output, name } = doc;
+  const { output, name, connId } = doc;
   const ex = useExtractStore.getState;
   const csv = output.csv ?? defaultCsvOpts();
   const parquet = output.parquet ?? defaultParquetOpts();
+  const xlsx = output.xlsx ?? defaultXlsxOpts();
   const encoding = csvEncoding(csv);
   const eucKr = encoding === 'euc-kr';
+  const conn = useConnectionsStore.getState().connections.find((c) => c.id === connId);
+  const isPg = conn?.driver === 'postgres';
 
   const browse = async () => {
     const dir = await pickDirectory(output.dir);
@@ -92,6 +96,7 @@ export function OutputOptionsForm({ tabId }: { tabId: string }) {
                 options={[
                   { value: 'csv', label: 'CSV' },
                   { value: 'parquet', label: 'Parquet' },
+                  { value: 'xlsx', label: 'XLSX', disabled: isPg },
                 ]}
               />
             </div>
@@ -180,6 +185,14 @@ export function OutputOptionsForm({ tabId }: { tabId: string }) {
                     onChange={(bom) => ex().setCsv(tabId, { bom })}
                   />
                   <CheckRow id={id('crlf')} label={qs('crlf')} checked={csv.crlf} onChange={(crlf) => ex().setCsv(tabId, { crlf })} />
+                </div>
+              </FormRow>
+            </>
+          ) : output.format === 'xlsx' ? (
+            <>
+              <FormRow label={qs('xlsxOptions')}>
+                <div className="flex flex-wrap gap-x-4 gap-y-0.5 pt-0.5">
+                  <CheckRow id={id('xlsx-header')} label={qs('header')} checked={xlsx.header} onChange={(header) => ex().setXlsx(tabId, { header })} />
                 </div>
               </FormRow>
             </>

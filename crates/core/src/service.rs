@@ -398,6 +398,17 @@ impl BulkDb {
         crate::dbeaver::import_file(Path::new(path))
     }
 
+    /// Build `BULKDB_*` environment variables for injecting a connection's details into a script
+    /// process. The password is read from the credential store (or the in-session cache for
+    /// "ask every time" connections).
+    pub fn conn_script_env(&self, conn_id: &str) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn_get(conn_id)?;
+        let password = self.creds.get(&credentials::db_password_key(conn_id)).ok().flatten().or_else(|| {
+            self.session_secrets.lock().unwrap().get(conn_id).cloned()
+        });
+        Ok(crate::script::connection_env(&conn, password.as_deref()))
+    }
+
     /// Remember a password typed for an "ask every time" connection for this process.
     pub(crate) fn remember_secret(&self, conn: &Connection, password: Option<String>) {
         if let Some(p) = password.filter(|p| !p.is_empty()) {

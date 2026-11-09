@@ -140,6 +140,12 @@ fn export_bindings() {
         CopyJobInfo,
         CopyRunInfo,
         CopyRunDetail,
+        // Script mode
+        ScriptRuntime,
+        RuntimeInfo,
+        ScriptStream,
+        ScriptLine,
+        ScriptDone,
     );
     // index.ts re-exporting every generated file, sorted for stable diffs.
     let mut names: Vec<String> = std::fs::read_dir(&dir)

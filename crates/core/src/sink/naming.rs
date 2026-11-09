@@ -13,6 +13,7 @@ pub fn extension(opts: &OutputOpts) -> String {
             }
         }
         OutputFormat::Parquet => ".parquet".to_string(),
+        OutputFormat::Xlsx => ".xlsx".to_string(),
     };
     if opts.format == OutputFormat::Csv {
         match opts.compress {

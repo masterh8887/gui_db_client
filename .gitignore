@@ -149,6 +149,7 @@ vite.config.ts.timestamp-*
 .turbo
 
 # BulkDB
+apps/desktop/AGENTS.md
 /target/
 apps/desktop/out/
 apps/desktop/.next/

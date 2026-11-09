@@ -24,6 +24,7 @@ import type {
   SqlCheck,
   SqlFile,
   Connection,
+  XlsxOpts,
 } from 'ipc-types';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
@@ -114,6 +115,10 @@ export function defaultParquetOpts(): ParquetOpts {
   return { compression: 'zstd', rowGroupMb: 128 };
 }
 
+export function defaultXlsxOpts(): XlsxOpts {
+  return { header: true };
+}
+
 export function defaultOutputOpts(): OutputOpts {
   return {
     dir: '',
@@ -121,6 +126,7 @@ export function defaultOutputOpts(): OutputOpts {
     format: 'csv',
     csv: defaultCsvOpts(),
     parquet: defaultParquetOpts(),
+    xlsx: defaultXlsxOpts(),
     overwrite: false,
   };
 }
@@ -161,6 +167,7 @@ export interface ExtractState {
   /** CSV file encoding: EUC-KR clears the BOM; UTF-8 removes the key (see `withCsvEncoding`). */
   setCsvEncoding(tabId: string, encoding: CsvEncoding): void;
   setParquet(tabId: string, patch: Partial<ParquetOpts>): void;
+  setXlsx(tabId: string, patch: Partial<XlsxOpts>): void;
   setSplit(tabId: string, split: SplitOpts | undefined): void;
   applyExcelPreset(tabId: string): void;
   /** Show a panel section (also expands the panel). */
@@ -352,6 +359,8 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
       edit(tabId, (d) => ({ output: { ...d.output, csv: withCsvEncoding(d.output.csv ?? defaultCsvOpts(), encoding) } })),
     setParquet: (tabId: string, p: Partial<ParquetOpts>) =>
       edit(tabId, (d) => ({ output: { ...d.output, parquet: { ...(d.output.parquet ?? defaultParquetOpts()), ...p } } })),
+    setXlsx: (tabId: string, p: Partial<XlsxOpts>) =>
+      edit(tabId, (d) => ({ output: { ...d.output, xlsx: { ...(d.output.xlsx ?? defaultXlsxOpts()), ...p } } })),
     setSplit: (tabId: string, split: SplitOpts | undefined) => edit(tabId, (d) => ({ output: { ...d.output, split } })),
     applyExcelPreset: (tabId: string) =>
       edit(tabId, (d) => ({
@@ -385,6 +394,7 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
         ...d.output,
         csv: d.output.format === 'csv' ? withCsvEncoding(d.output.csv ?? defaultCsvOpts(), csvEncoding(d.output.csv)) : undefined,
         parquet: d.output.format === 'parquet' ? (d.output.parquet ?? defaultParquetOpts()) : undefined,
+        xlsx: d.output.format === 'xlsx' ? (d.output.xlsx ?? defaultXlsxOpts()) : undefined,
         compress: d.output.format === 'csv' ? d.output.compress : undefined,
       };
       return {
@@ -665,6 +675,7 @@ export const useExtractStore = create<ExtractState>()((set, get) => {
       isStr(a) ? api.setCsv(a, b ?? {}) : api.setCsv(legacyTarget(), a as Partial<CsvOpts>)) as ExtractState['setCsv'],
     setParquet: ((a: unknown, b?: Partial<ParquetOpts>) =>
       isStr(a) ? api.setParquet(a, b ?? {}) : api.setParquet(legacyTarget(), a as Partial<ParquetOpts>)) as ExtractState['setParquet'],
+    setXlsx: (tabId: string, p: Partial<XlsxOpts>) => api.setXlsx(tabId, p),
     setSplit: ((a: unknown, b?: SplitOpts) =>
       isStr(a) ? api.setSplit(a, b) : api.setSplit(legacyTarget(), a as SplitOpts | undefined)) as ExtractState['setSplit'],
     applyExcelPreset: ((a?: unknown) => api.applyExcelPreset(isStr(a) ? a : legacyTarget())) as ExtractState['applyExcelPreset'],

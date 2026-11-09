@@ -2,7 +2,7 @@
 
 // The workspace tab strip (DESIGN.md §5.C "Tab bar") over `TabBar` / `TabItem`.
 
-import { FileCode2, History, Table2 } from 'lucide-react';
+import { FileCode2, History, Table2, Terminal } from 'lucide-react';
 import { useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { runAction } from '@/lib/actions';
@@ -39,7 +39,7 @@ function WorkspaceTabItem({
   const tabs = useTabsStore.getState;
   const title = tabTitle(tab, doc ?? undefined);
   const preview = tab.kind === 'table' && tab.preview;
-  const icon = tab.kind === 'query' ? <FileCode2 strokeWidth={1.75} /> : tab.kind === 'table' ? <Table2 strokeWidth={1.75} /> : <History strokeWidth={1.75} />;
+  const icon = tab.kind === 'query' ? <FileCode2 strokeWidth={1.75} /> : tab.kind === 'table' ? <Table2 strokeWidth={1.75} /> : tab.kind === 'script' ? <Terminal strokeWidth={1.75} /> : <History strokeWidth={1.75} />;
 
   const items: MenuItem[] = [
     { id: 'close', label: ls('close'), shortcut: 'mod+w', onSelect: () => tabs().close(tab.id) },
@@ -89,6 +89,7 @@ export function WorkspaceTabBar({ connId }: { connId: string }) {
   const activeId = useTabsStore((s) => s.sets[connId]?.activeId ?? null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const openQuery = () => useTabsStore.getState().openQuery(connId);
+  const openScript = () => useTabsStore.getState().openScript(connId);
 
   return (
     <TabBar
@@ -99,6 +100,7 @@ export function WorkspaceTabBar({ connId }: { connId: string }) {
       newTabContextItems={[
         { id: 'new', label: ls('newQuery'), shortcut: 'mod+t', onSelect: openQuery },
         { id: 'file', label: ls('openSqlFile'), shortcut: 'mod+o', onSelect: () => void runAction('query.openFile') },
+        { id: 'script', label: '새 스크립트', onSelect: openScript },
         { id: 'history', label: ls('fullHistory'), onSelect: () => useTabsStore.getState().openHistory(connId) },
       ]}
     >

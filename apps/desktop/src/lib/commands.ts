@@ -27,7 +27,9 @@ import type {
   PlanSummary,
   PreflightReport,
   ProbeResult,
+  RuntimeInfo,
   SchemaInfo,
+  ScriptRuntime,
   Settings,
   SqlCheck,
   SqlFile,
@@ -170,3 +172,14 @@ export const instancesInfo = () => invoke<InstancesInfo>('instances_info');
 export const instanceSpawn = () => invoke<void>('instance_spawn');
 /** The user accepted "cancel the running jobs and quit". */
 export const appQuitConfirmed = () => invoke<void>('app_quit_confirmed');
+
+// ---- script mode ---------------------------------------------------------------------------
+
+/** Probe whether a runtime is installed; returns its version + path, or `null`. */
+export const scriptDetectRuntime = (runtime: ScriptRuntime) => invoke<RuntimeInfo | null>('script_detect_runtime', { runtime });
+/** Start installing a runtime (winget / brew). Returns job id; streams `script:line` / `script:done`. */
+export const scriptInstallRuntime = (runtime: ScriptRuntime) => invoke<string>('script_install_runtime', { runtime });
+/** Run a script. Streams `script:line` / `script:done` events. */
+export const scriptRun = (jobId: string, connId: string, runtime: ScriptRuntime, script: string) => invoke<void>('script_run', { jobId, connId, runtime, script });
+/** Cancel a running script job. */
+export const scriptCancel = (jobId: string) => invoke<void>('script_cancel', { jobId });

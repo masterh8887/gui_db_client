@@ -35,6 +35,7 @@ use crate::sink::compress::CompressWriter;
 use crate::sink::csv::CsvSink;
 use crate::sink::naming::partial_path;
 use crate::sink::parquet::{ParquetSink, SizeCalibration};
+use crate::sink::xlsx::XlsxSink;
 use crate::sink::{Sink, SinkReport, SinkTarget};
 use crate::source::Batch;
 use crate::types::OutputFormat;
@@ -426,6 +427,10 @@ pub fn open_single_calibrated(target: &SinkTarget, n: u32, calibration: &SizeCal
             }
             Ok(Box::new(ParquetSink::new(path, popts).with_overwrite(overwrite).with_calibration(calibration.clone())))
         }
+        OutputFormat::Xlsx => {
+            let xlsx_opts = target.opts.xlsx.clone().unwrap_or_default();
+            Ok(Box::new(XlsxSink::new(path, xlsx_opts)?))
+        }
     }
 }
 
@@ -443,9 +448,12 @@ pub fn build_stack(target: &SinkTarget) -> Result<Box<dyn Sink>> {
     let factory: SinkFactory = Box::new(move |n| open_single_calibrated(&t, n, &calibration));
     let t = target.clone();
     let path_fn: PathFn = Box::new(move |n| t.path_for(n));
-    let split = target.opts.split.as_ref().filter(|s| s.rows.is_some_and(|r| r > 0) || s.megabytes.is_some_and(|m| m > 0));
-    let sink = match split {
+    let user_split = target.opts.split.as_ref().filter(|s| s.rows.is_some_and(|r| r > 0) || s.megabytes.is_some_and(|m| m > 0));
+    let sink = match user_split {
         Some(s) => SplitSink::new(factory, s.rows, s.megabytes),
+        // XLSX sheets are capped at 1,048,576 rows; impose a 1,000,000-row split automatically
+        // so each file stays well under that limit without the user having to configure it.
+        None if target.opts.format == OutputFormat::Xlsx => SplitSink::new(factory, Some(1_000_000), None),
         None => SplitSink::single(factory),
     };
     Ok(Box::new(sink.with_path_fn(path_fn)))

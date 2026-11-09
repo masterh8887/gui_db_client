@@ -44,6 +44,9 @@ export function outputSummary(output: QueryDoc['output']): { text: string; path:
     else if (csv.bom) parts.push('BOM');
     if (output.compress) parts.push(output.compress);
     ext = `.csv${output.compress === 'gzip' ? '.gz' : output.compress === 'zstd' ? '.zst' : ''}`;
+  } else if (output.format === 'xlsx') {
+    parts.push('XLSX');
+    ext = '.xlsx';
   } else {
     const pq = output.parquet ?? defaultParquetOpts();
     parts.push('Parquet');
