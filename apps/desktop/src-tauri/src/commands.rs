@@ -537,10 +537,31 @@ pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>
                 return;
             }
         };
+        // For Node.js: write the bulkdb helper and inject it via --require.
+        let helper_tmp = if runtime == ScriptRuntime::Node {
+            let content = bulk_core::script::node_helper_js();
+            match tokio::task::spawn_blocking(move || {
+                let mut f = tempfile::Builder::new().suffix("-bulkdb.cjs").tempfile()?;
+                use std::io::Write;
+                f.write_all(content.as_bytes())?;
+                f.flush()?;
+                Ok::<_, std::io::Error>(f)
+            }).await {
+                Ok(Ok(f)) => Some(f),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let (exe, extra_args) = bulk_core::script::runtime_args(runtime);
         let script_path = tmp.path().to_string_lossy().into_owned();
         let mut cmd = TokioCommand::new(exe);
-        cmd.args(extra_args).arg(&script_path).envs(&env).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        cmd.args(extra_args);
+        if let Some(ref h) = helper_tmp {
+            cmd.arg("--require").arg(h.path());
+        }
+        cmd.arg(&script_path).envs(&env).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         match cmd.spawn() {
             Err(e) => {
                 let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start {exe}: {e}"), ts: now_rfc3339() });
@@ -551,6 +572,7 @@ pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>
                 let exit = child.wait().await.ok();
                 let cancelled = token.is_cancelled();
                 let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 });
+                drop(helper_tmp);
                 drop(tmp);
             }
         }

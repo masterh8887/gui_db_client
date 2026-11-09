@@ -83,6 +83,12 @@ pub fn install_command(runtime: ScriptRuntime) -> Vec<String> {
     }
 }
 
+/// The Node.js helper module injected via `node --require` into every script-tab run.
+/// Provides `global.bulkdb` with auto-connection and a Prisma-style query builder.
+pub fn node_helper_js() -> &'static str {
+    include_str!("node_helper.js")
+}
+
 /// Executable + args to run `script_path` with the given runtime.
 pub fn runtime_args(runtime: ScriptRuntime) -> (&'static str, &'static [&'static str]) {
     match runtime {

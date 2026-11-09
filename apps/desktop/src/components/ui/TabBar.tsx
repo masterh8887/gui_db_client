@@ -5,6 +5,7 @@ import { useEffect, useRef, type DragEvent, type KeyboardEvent, type ReactNode }
 import { isMac } from '@/lib/platform';
 import { cn } from '@/lib/utils';
 import { ContextMenu, type MenuItem } from './ContextMenu';
+import { DropdownMenu } from './DropdownMenu';
 import { IconButton } from './IconButton';
 import { Spinner } from './Spinner';
 import { us } from './strings';
@@ -72,11 +73,21 @@ export function TabBar({ children, onNewTab, newTabContextItems, onEmptyDoubleCl
     if (from >= 0 && to >= 0 && from !== to) onReorder(from, to);
   };
 
-  const plus = (
-    <IconButton label={us('newTab')} size="sm" onClick={onNewTab} className="mx-1 self-center">
-      <Plus size={14} strokeWidth={1.75} />
-    </IconButton>
-  );
+  // When a context menu is provided, left-click on + shows a dropdown (choose query vs script etc.)
+  // instead of opening a query directly. Right-click still works via ContextMenu for discoverability.
+  const plusIcon = <Plus size={14} strokeWidth={1.75} />;
+  const plus =
+    newTabContextItems && newTabContextItems.length > 0 ? (
+      <DropdownMenu items={newTabContextItems} align="start">
+        <IconButton label={us('newTab')} size="sm" noTooltip className="mx-1 self-center">
+          {plusIcon}
+        </IconButton>
+      </DropdownMenu>
+    ) : (
+      <IconButton label={us('newTab')} size="sm" onClick={onNewTab} className="mx-1 self-center">
+        {plusIcon}
+      </IconButton>
+    );
 
   return (
     // The bottom hairline is an inset shadow, so the active tab (bg-window) paints over it and
@@ -97,13 +108,7 @@ export function TabBar({ children, onNewTab, newTabContextItems, onEmptyDoubleCl
         {children}
         {empty}
       </div>
-      {newTabContextItems && newTabContextItems.length > 0 ? (
-        <ContextMenu items={newTabContextItems} className="flex items-stretch">
-          {plus}
-        </ContextMenu>
-      ) : (
-        plus
-      )}
+      {plus}
     </div>
   );
 }

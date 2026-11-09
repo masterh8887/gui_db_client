@@ -19,10 +19,20 @@ const STRINGS = {
   stateInstall: '설치 중',
   exitCode: (code: number) => `exit ${code}`,
   duration: (ms: number) => ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`,
-  placeholderNode: `// Node.js 스크립트
-// BULKDB_HOST, BULKDB_PORT, BULKDB_DATABASE, BULKDB_USER, BULKDB_PASSWORD 환경변수 사용 가능
-const { execSync } = require('child_process');
-console.log('host:', process.env.BULKDB_HOST);`,
+  placeholderNode: `// Node.js 스크립트 — bulkdb 헬퍼 자동 주입 (global.bulkdb)
+// npm install -g pg  |  mysql2  |  better-sqlite3  |  mssql  (드라이버별 1개 필요)
+
+// 테이블 조회 (Prisma 스타일)
+const rows = await bulkdb.from('테이블명')
+  .select('컬럼1', '컬럼2')   // 생략 시 SELECT *
+  .where({ status: 'active' }) // 생략 가능
+  .limit(100)
+  .fetch();
+console.log(rows);
+
+// 직접 SQL
+// const result = await bulkdb.query('SELECT COUNT(*) FROM 테이블명');
+// console.log(result);`,
   placeholderPython: `# Python 스크립트
 # BULKDB_HOST, BULKDB_PORT, BULKDB_DATABASE, BULKDB_USER, BULKDB_PASSWORD 환경변수 사용 가능
 import os, sys

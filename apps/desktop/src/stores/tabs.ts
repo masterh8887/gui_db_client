@@ -222,7 +222,7 @@ export const useTabsStore = create<TabsState>()((set, get) => {
       const seq =
         cur.ids.reduce((max, id) => {
           const tab = s.tabs[id];
-          return tab?.kind === 'query' || tab?.kind === 'script' ? Math.max(max, tab.seq) : max;
+          return tab?.kind === 'script' ? Math.max(max, tab.seq) : max;
         }, 0) + 1;
       const id = newId('q');
       const tab: ScriptTab = { id, kind: 'script', connId, seq };
@@ -476,6 +476,6 @@ export function tabTitle(tab: WorkspaceTab, doc?: Pick<QueryDoc, 'name'>): strin
     case 'history':
       return ts('historyTitle');
     case 'script':
-      return ts('queryTitle', { n: tab.seq });
+      return ts('scriptTitle', { n: tab.seq });
   }
 }

@@ -5,6 +5,7 @@ import { defineStrings } from '@/lib/i18n';
 export const ts = defineStrings('stores', {
   en: {
     queryTitle: 'Query {n}',
+    scriptTitle: 'Script {n}',
     historyTitle: 'History',
     connNotFound: 'Connection not found',
     closeDirtyTitle: 'Close the workspace of {name}?',
@@ -14,6 +15,7 @@ export const ts = defineStrings('stores', {
   },
   ko: {
     queryTitle: '쿼리 {n}',
+    scriptTitle: '스크립트 {n}',
     historyTitle: '기록',
     connNotFound: '연결을 찾을 수 없습니다',
     closeDirtyTitle: '{name} 작업공간을 닫을까요?',
