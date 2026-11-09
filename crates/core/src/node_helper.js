@@ -158,13 +158,35 @@
     return Number((rows[0] || {}).cnt || (rows[0] || {}).count || 0);
   };
 
+  // ---- SQL guard: SELECT / WITH(CTE) only ----
+  function guardSql(sql) {
+    // Strip block comments and line comments, then check the first keyword.
+    var stripped = sql
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/--[^\n]*/g, ' ')
+      .trim()
+      .toUpperCase();
+    if (!/^(SELECT|WITH)\b/.test(stripped)) {
+      throw new Error(
+        'BulkDB: 읽기 전용 모드 — SELECT / WITH(CTE) 쿼리만 허용됩니다.\n' +
+        'UPDATE, DELETE, INSERT, DROP, CREATE, ALTER 등은 차단됩니다.'
+      );
+    }
+  }
+
   // ---- Public API ----
   global.bulkdb = {
     driver: DRV,
     /** Build a SELECT query for `table`. Chain: .select() .where() .limit() .orderBy() .fetch() */
     from:   function (table) { return new Q(table); },
-    /** Run raw SQL. `params` uses driver-native placeholders ($1 for PG, ? for MySQL/SQLite). */
-    query:  async function (sql, params) { return (await connect()).query(sql, params); },
+    /**
+     * Run raw SQL — SELECT / WITH only. Any DML/DDL throws before hitting the DB.
+     * `params` uses driver-native placeholders ($1 for PG, ? for MySQL/SQLite/MSSQL).
+     */
+    query:  async function (sql, params) {
+      guardSql(sql);
+      return (await connect()).query(sql, params);
+    },
     /** Close the connection (called automatically on process exit). */
     close:  async function () { if (_conn) { await _conn.end(); _conn = null; } },
   };
