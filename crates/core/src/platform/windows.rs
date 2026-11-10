@@ -3,6 +3,17 @@ use std::path::{Path, PathBuf};
 pub const OS_KEY: &str = "windows";
 pub const CSV_CRLF_DEFAULT: bool = true;
 
+/// Where a Python interpreter is usually installed, probed when none is on PATH (e.g. a GUI app
+/// whose PATH was captured before Python was installed). The `py` launcher comes first because it
+/// resolves the best installed version itself. Patterns may use %VAR% and *.
+pub const PYTHON_EXE_PATTERNS: &[&str] = &[
+    r"C:\Windows\py.exe",
+    r"%LOCALAPPDATA%\Programs\Python\Launcher\py.exe",
+    r"%LOCALAPPDATA%\Programs\Python\Python3*\python.exe",
+    r"%PROGRAMFILES%\Python3*\python.exe",
+    r"%ProgramW6432%\Python3*\python.exe",
+];
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("BulkDB")
 }

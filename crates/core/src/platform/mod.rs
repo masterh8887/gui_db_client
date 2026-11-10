@@ -58,6 +58,13 @@ pub fn library_file_name(base: &str) -> String {
     imp::library_file_name(base)
 }
 
+/// Existing Python interpreters at well-known install locations, probed when none is on PATH
+/// (e.g. a GUI app whose PATH was captured before Python was installed). The order is the OS
+/// module's; the `py` launcher, listed first on Windows, resolves the best installed version.
+pub fn python_exe_candidates() -> Vec<PathBuf> {
+    imp::PYTHON_EXE_PATTERNS.iter().flat_map(|p| expand_probe_path(p)).filter(|p| p.is_file()).collect()
+}
+
 /// Expand `%VAR%` / `$VAR` / `~` in a registry probe path and glob `*`.
 pub fn expand_probe_path(pattern: &str) -> Vec<PathBuf> {
     let expanded = expand_env(pattern);

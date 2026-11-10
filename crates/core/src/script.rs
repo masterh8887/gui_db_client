@@ -35,8 +35,17 @@ fn looks_like_version(s: &str) -> bool {
 }
 
 /// Probe whether `runtime` is installed and return its version + path, or `None` if not found.
+///
+/// Tries the executable names on PATH first, then — for Python — well-known install locations, so
+/// a GUI app whose PATH was captured before Python was installed still finds it.
 pub fn detect_runtime(runtime: ScriptRuntime) -> Option<RuntimeInfo> {
-    runtime_candidates(runtime).iter().find_map(|exe| probe_exe(runtime, exe))
+    if let Some(info) = runtime_candidates(runtime).iter().find_map(|exe| probe_exe(runtime, exe)) {
+        return Some(info);
+    }
+    if runtime == ScriptRuntime::Python {
+        return crate::platform::python_exe_candidates().iter().find_map(|path| probe_exe(runtime, &path.to_string_lossy()));
+    }
+    None
 }
 
 fn probe_exe(runtime: ScriptRuntime, exe: &str) -> Option<RuntimeInfo> {
@@ -47,7 +56,9 @@ fn probe_exe(runtime: ScriptRuntime, exe: &str) -> Option<RuntimeInfo> {
     if !looks_like_version(&version) {
         return None;
     }
-    let path = which_exe(exe).unwrap_or_else(|| exe.to_string());
+    // An absolute path (a known-location probe) is already the executable to run; a bare name is
+    // resolved against PATH.
+    let path = if std::path::Path::new(exe).is_absolute() { exe.to_string() } else { which_exe(exe).unwrap_or_else(|| exe.to_string()) };
     Some(RuntimeInfo { runtime, version, path })
 }
 
@@ -85,9 +96,10 @@ fn which_exe(name: &str) -> Option<String> {
 pub fn install_command(runtime: ScriptRuntime) -> Vec<String> {
     #[cfg(windows)]
     {
+        // winget has no evergreen "Python.Python.3"; the ids are version-specific (…3.12, …3.13).
         let (id, _ver) = match runtime {
             ScriptRuntime::Node => ("OpenJS.NodeJS.LTS", ""),
-            ScriptRuntime::Python => ("Python.Python.3", ""),
+            ScriptRuntime::Python => ("Python.Python.3.13", ""),
             ScriptRuntime::Bash => ("Git.Git", ""),
         };
         vec!["winget".into(), "install".into(), "--id".into(), id.into(), "-e".into(), "--accept-package-agreements".into(), "--accept-source-agreements".into()]
@@ -237,6 +249,18 @@ mod tests {
                 assert!(looks_like_version(&info.version), "{runtime:?}: {:?}", info.version);
                 assert!(!runtime_exe(runtime).is_empty());
             }
+        }
+    }
+
+    /// The known-location fallback lists only real files, and each one probes as a valid Python —
+    /// so a GUI app whose PATH predates the Python install still detects it.
+    #[test]
+    fn python_known_locations_are_real_interpreters() {
+        for path in crate::platform::python_exe_candidates() {
+            assert!(path.is_file(), "{}", path.display());
+            let info = probe_exe(ScriptRuntime::Python, &path.to_string_lossy());
+            assert!(info.is_some(), "known location did not probe as Python: {}", path.display());
+            assert_eq!(info.unwrap().path, path.to_string_lossy());
         }
     }
 

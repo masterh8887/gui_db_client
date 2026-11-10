@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 pub const OS_KEY: &str = "linux";
 pub const CSV_CRLF_DEFAULT: bool = false;
 
+/// Fallback Python locations probed when none is on PATH (python3 is normally on PATH on Linux).
+pub const PYTHON_EXE_PATTERNS: &[&str] = &["/usr/bin/python3", "/usr/local/bin/python3"];
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("BulkDB")
 }
