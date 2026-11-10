@@ -6,6 +6,7 @@
 import type { TableRef } from 'ipc-types';
 import { useShallow } from 'zustand/react/shallow';
 import { ActivityPanel } from '@/components/monitor/ActivityPanel';
+import { ScriptInspector } from '@/components/script/ScriptInspector';
 import { TableInspector } from '@/components/table/TableInspector';
 import { EmptyState, InspectorPanel } from '@/components/ui';
 import { selectActiveJobs, useJobsStore } from '@/stores/jobs';
@@ -36,7 +37,9 @@ export function InspectorFrame({ connId }: { connId: string }) {
   const segment = useUiStore((s) => s.inspectorSegment);
   const setSegment = useUiStore((s) => s.setInspectorSegment);
   const activeCount = useJobsStore(useShallow(selectActiveJobs)).length;
+  const activeTab = useTabsStore((s) => selectActiveTab(s, connId));
   const target = useInspectorTarget(connId);
+  const scriptTab = activeTab?.kind === 'script' ? activeTab : null;
 
   return (
     <aside aria-label={ls('inspector')} className="relative h-full shrink-0 border-l border-separator" style={{ width }}>
@@ -59,6 +62,8 @@ export function InspectorFrame({ connId }: { connId: string }) {
       >
         {segment === 'activity' ? (
           <ActivityPanel variant="inspector" />
+        ) : scriptTab ? (
+          <ScriptInspector tabId={scriptTab.id} connId={scriptTab.connId} />
         ) : target.inOverview ? (
           <EmptyState title={ls('detailsInOverview')} />
         ) : target.table ? (

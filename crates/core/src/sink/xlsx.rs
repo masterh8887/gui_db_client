@@ -12,7 +12,10 @@
 use std::path::PathBuf;
 
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow_array::{Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
+use arrow_array::{
+    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array,
+    UInt64Array, UInt8Array,
+};
 use arrow_schema::DataType;
 use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
 
@@ -60,9 +63,7 @@ impl XlsxSink {
             let bold = Format::new().set_bold();
             let row = self.row;
             for (col, field) in schema.fields().iter().enumerate() {
-                self.ws()?
-                    .write_string_with_format(row, col as u16, field.name(), &bold)
-                    .map_err(|e| xlsx_err(&format!("header col {col}"), e))?;
+                self.ws()?.write_string_with_format(row, col as u16, field.name(), &bold).map_err(|e| xlsx_err(&format!("header col {col}"), e))?;
             }
             self.row += 1;
         }
@@ -87,9 +88,7 @@ impl XlsxSink {
 
         for row_idx in 0..rb.num_rows() {
             if self.row >= EXCEL_MAX_ROWS {
-                return Err(CoreError::Invalid(format!(
-                    "Excel row limit ({EXCEL_MAX_ROWS}) reached. Add a row split to spread the output across multiple files."
-                )));
+                return Err(CoreError::Invalid(format!("Excel row limit ({EXCEL_MAX_ROWS}) reached. Add a row split to spread the output across multiple files.")));
             }
             let excel_row = self.row;
             for (col_idx, column) in rb.columns().iter().enumerate() {
@@ -97,8 +96,7 @@ impl XlsxSink {
                     continue;
                 }
                 let ws = self.ws()?;
-                write_cell(ws, excel_row, col_idx as u16, column.as_ref(), row_idx, &fmt_opts)
-                    .map_err(|e| xlsx_err(&format!("row {excel_row} col {col_idx}"), e))?;
+                write_cell(ws, excel_row, col_idx as u16, column.as_ref(), row_idx, &fmt_opts).map_err(|e| xlsx_err(&format!("row {excel_row} col {col_idx}"), e))?;
             }
             self.row += 1;
             self.data_rows += 1;
@@ -108,14 +106,7 @@ impl XlsxSink {
     }
 }
 
-fn write_cell(
-    ws: &mut Worksheet,
-    row: u32,
-    col: u16,
-    array: &dyn Array,
-    idx: usize,
-    fmt_opts: &FormatOptions,
-) -> std::result::Result<(), XlsxError> {
+fn write_cell(ws: &mut Worksheet, row: u32, col: u16, array: &dyn Array, idx: usize, fmt_opts: &FormatOptions) -> std::result::Result<(), XlsxError> {
     macro_rules! write_int {
         ($A:ty) => {{
             ws.write_number(row, col, array.as_any().downcast_ref::<$A>().unwrap().value(idx) as f64)?;
@@ -169,9 +160,9 @@ impl Sink for XlsxSink {
     fn write(&mut self, batch: Batch) -> Result<()> {
         match batch {
             Batch::Arrow(rb) => self.write_batch(&rb),
-            Batch::RawCsv { .. } | Batch::RawCsvHeader(_) => Err(CoreError::Invalid(
-                "XLSX format does not support PostgreSQL raw-CSV output. Use CSV or Parquet instead.".into(),
-            )),
+            Batch::RawCsv { .. } | Batch::RawCsvHeader(_) => {
+                Err(CoreError::Invalid("XLSX format does not support PostgreSQL raw-CSV output. Use CSV or Parquet instead.".into()))
+            }
         }
     }
 
@@ -187,7 +178,7 @@ impl Sink for XlsxSink {
     }
 
     fn abort(self: Box<Self>) -> Vec<PathBuf> {
-        let path = (*self).path;
+        let path = self.path;
         if path.exists() {
             vec![crate::sink::to_partial(&path)]
         } else {
@@ -202,6 +193,10 @@ impl Sink for XlsxSink {
 
     /// Returns 1 once we have started writing (a file will be produced at `finish()`).
     fn files_so_far(&self) -> u32 {
-        if self.has_data || self.headers_written { 1 } else { 0 }
+        if self.has_data || self.headers_written {
+            1
+        } else {
+            0
+        }
     }
 }

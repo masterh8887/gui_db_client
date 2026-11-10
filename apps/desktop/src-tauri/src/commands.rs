@@ -468,7 +468,7 @@ pub async fn app_quit_confirmed(app: AppHandle) -> CmdResult<()> {
 /// `null` when not found.
 #[tauri::command]
 pub async fn script_detect_runtime(runtime: ScriptRuntime) -> CmdResult<Option<RuntimeInfo>> {
-    Ok(tokio::task::spawn_blocking(move || bulk_core::script::detect_runtime(runtime)).await.map_err(|e| CmdError::internal(format!("spawn_blocking: {e}")))?)
+    tokio::task::spawn_blocking(move || bulk_core::script::detect_runtime(runtime)).await.map_err(|e| CmdError::internal(format!("spawn_blocking: {e}")))
 }
 
 /// Kick off the OS package manager to install `runtime`. Streams output lines as `script:line`
@@ -490,14 +490,18 @@ pub async fn script_install_runtime(jobs: State<'_, ScriptJobs>, app: AppHandle,
         let result = cmd.spawn();
         match result {
             Err(e) => {
-                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start: {e}"), ts: now_rfc3339() });
+                let _ =
+                    app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start: {e}"), ts: now_rfc3339() });
                 let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
             }
             Ok(mut child) => {
                 stream_child(&app, &jid, &mut child, &token).await;
                 let exit = child.wait().await.ok();
                 let cancelled = token.is_cancelled();
-                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 });
+                let _ = app.emit(
+                    "script:done",
+                    ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 },
+                );
             }
         }
     });
@@ -509,25 +513,45 @@ pub async fn script_install_runtime(jobs: State<'_, ScriptJobs>, app: AppHandle,
 /// Returns the job id immediately (the caller supplies it so the UI can register the listener
 /// before the first line arrives).
 #[tauri::command]
-pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>, app: AppHandle, job_id: String, conn_id: String, runtime: ScriptRuntime, script: String) -> CmdResult<()> {
-    let env = blocking(&svc, move |db| db.conn_script_env(&conn_id)).await?;
+pub async fn script_run(
+    svc: State<'_, Arc<BulkDb>>,
+    jobs: State<'_, ScriptJobs>,
+    app: AppHandle,
+    job_id: String,
+    conn_id: String,
+    runtime: ScriptRuntime,
+    script: String,
+) -> CmdResult<()> {
+    let source = script.clone();
+    let env = blocking(&svc, move |db| db.conn_script_env(&conn_id, &source)).await?;
     let token = CancellationToken::new();
     jobs.0.lock().unwrap().insert(job_id.clone(), token.clone());
     let jid = job_id.clone();
     tokio::spawn(async move {
         let started = Instant::now();
         // Write script to a temp file so multi-line scripts work without shell escaping.
-        let ext = match runtime { ScriptRuntime::Node => "js", ScriptRuntime::Python => "py", ScriptRuntime::Bash => "sh" };
+        // `.mjs`: always an ES module. A `.js` file is one only when Node cannot parse it as
+        // CommonJS, and `await (x)` parses there as a call, failing with "await is not defined".
+        let ext = match runtime {
+            ScriptRuntime::Node => "mjs",
+            ScriptRuntime::Python => "py",
+            ScriptRuntime::Bash => "sh",
+        };
         let tmp = match tokio::task::spawn_blocking(move || {
             let mut f = tempfile::Builder::new().suffix(&format!(".{ext}")).tempfile()?;
             use std::io::Write;
             f.write_all(script.as_bytes())?;
             f.flush()?;
             Ok::<_, std::io::Error>(f)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
-                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to write script: {e}"), ts: now_rfc3339() });
+                let _ = app.emit(
+                    "script:line",
+                    ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to write script: {e}"), ts: now_rfc3339() },
+                );
                 let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
                 return;
             }
@@ -546,7 +570,9 @@ pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>
                 f.write_all(content.as_bytes())?;
                 f.flush()?;
                 Ok::<_, std::io::Error>(f)
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(f)) => Some(f),
                 _ => None,
             }
@@ -564,14 +590,20 @@ pub async fn script_run(svc: State<'_, Arc<BulkDb>>, jobs: State<'_, ScriptJobs>
         cmd.arg(&script_path).envs(&env).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         match cmd.spawn() {
             Err(e) => {
-                let _ = app.emit("script:line", ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start {exe}: {e}"), ts: now_rfc3339() });
+                let _ = app.emit(
+                    "script:line",
+                    ScriptLine { job_id: jid.clone(), stream: ScriptStream::Stderr, text: format!("failed to start {exe}: {e}"), ts: now_rfc3339() },
+                );
                 let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: Some(-1), cancelled: false, duration_ms: started.elapsed().as_millis() as u64 });
             }
             Ok(mut child) => {
                 stream_child(&app, &jid, &mut child, &token).await;
                 let exit = child.wait().await.ok();
                 let cancelled = token.is_cancelled();
-                let _ = app.emit("script:done", ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 });
+                let _ = app.emit(
+                    "script:done",
+                    ScriptDone { job_id: jid, exit_code: exit.and_then(|s| s.code()), cancelled, duration_ms: started.elapsed().as_millis() as u64 },
+                );
                 drop(helper_tmp);
                 drop(tmp);
             }

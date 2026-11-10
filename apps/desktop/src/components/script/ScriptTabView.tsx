@@ -12,7 +12,8 @@ import { useShallow } from 'zustand/react/shallow';
 import { formatDuration } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { Button, DropdownMenu, Spinner, StatusBar, Tooltip, type MenuItem } from '@/components/ui';
-import { useScriptStore, type LogLine, type ScriptJobState } from '@/stores/script';
+import { useConnectionsStore } from '@/stores/connections';
+import { registerScriptEditor, useScriptStore, type LogLine, type ScriptJobState } from '@/stores/script';
 import { ss } from './strings';
 
 const RUNTIMES: ScriptRuntime[] = ['node', 'python', 'bash'];
@@ -104,13 +105,38 @@ function ScriptBar({ tabId }: { tabId: string }) {
 
 // ----- ScriptEditor --------------------------------------------------------------------------
 
-function ScriptEditor({ tabId, runtime }: { tabId: string; runtime: ScriptRuntime }) {
+function ScriptEditor({ tabId, connId, runtime }: { tabId: string; connId: string; runtime: ScriptRuntime }) {
   const script = useScriptStore((s) => s.docs[tabId]?.script ?? '');
+  const connName = useConnectionsStore((s) => s.connections.find((c) => c.id === connId)?.name ?? '');
   const store = useScriptStore.getState;
-  const placeholder = runtime === 'node' ? ss('placeholderNode') : runtime === 'python' ? ss('placeholderPython') : ss('placeholderBash');
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const placeholder =
+    runtime === 'node' ? ss('placeholderNode', JSON.stringify(connName)) : runtime === 'python' ? ss('placeholderPython') : ss('placeholderBash');
+
+  // Let the inspector palette insert snippets at the cursor (keeps the caret and the current text).
+  useEffect(() => {
+    return registerScriptEditor(tabId, (text) => {
+      const el = ref.current;
+      const current = useScriptStore.getState().docs[tabId]?.script ?? '';
+      const start = el ? el.selectionStart : current.length;
+      const end = el ? el.selectionEnd : current.length;
+      // A snippet dropped onto a non-empty line starts on its own line.
+      const needsLeadingNl = start > 0 && current[start - 1] !== '\n';
+      const chunk = (needsLeadingNl ? '\n' : '') + text + (text.endsWith('\n') ? '' : '\n');
+      const next = current.slice(0, start) + chunk + current.slice(end);
+      store().setScript(tabId, next);
+      const caret = start + chunk.length;
+      requestAnimationFrame(() => {
+        if (!ref.current) return;
+        ref.current.focus();
+        ref.current.setSelectionRange(caret, caret);
+      });
+    });
+  }, [tabId, store]);
 
   return (
     <textarea
+      ref={ref}
       className="min-h-0 flex-1 resize-none bg-bg px-3 py-2 font-mono text-sm text-fg outline-none placeholder:text-fg-placeholder"
       value={script}
       placeholder={placeholder}
@@ -200,7 +226,7 @@ export function ScriptTabView({ tabId }: { tabId: string }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <ScriptBar tabId={tabId} />
-      <ScriptEditor tabId={tabId} runtime={runtime} />
+      <ScriptEditor tabId={tabId} connId={connId} runtime={runtime} />
       <ScriptFooter tabId={tabId} />
       <ScriptLogView tabId={tabId} />
     </div>

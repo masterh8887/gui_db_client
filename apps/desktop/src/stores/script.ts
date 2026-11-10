@@ -40,6 +40,8 @@ export interface ScriptState {
   disposeDoc(tabId: string): void;
   setRuntime(tabId: string, runtime: ScriptRuntime): void;
   setScript(tabId: string, script: string): void;
+  /** Insert `text` into the editor at the cursor (via the registered editor, else append). */
+  insertSnippet(tabId: string, text: string): void;
   clearLog(tabId: string): void;
   detectRuntime(runtime: ScriptRuntime): Promise<RuntimeInfo | null>;
   installRuntime(tabId: string, runtime: ScriptRuntime): Promise<void>;
@@ -52,6 +54,18 @@ export interface ScriptState {
 let listenersSetup = false;
 // job_id → tabId mapping (for routing events back to the right doc)
 const jobToTab: Map<string, string> = new Map();
+
+// tabId → the mounted editor's "insert at cursor" handler. Not reactive state: the registry is a
+// plain map the ScriptEditor fills on mount so the inspector palette can insert snippets.
+const editors: Map<string, (text: string) => void> = new Map();
+
+/** Called by ScriptEditor on mount; returns an unregister function for cleanup. */
+export function registerScriptEditor(tabId: string, insert: (text: string) => void): () => void {
+  editors.set(tabId, insert);
+  return () => {
+    if (editors.get(tabId) === insert) editors.delete(tabId);
+  };
+}
 
 function ensureListeners() {
   if (listenersSetup) return;
@@ -123,6 +137,21 @@ export const useScriptStore = create<ScriptState>()((set, get) => ({
       const doc = s.docs[tabId];
       if (!doc) return s;
       return { docs: { ...s.docs, [tabId]: { ...doc, script } } };
+    });
+  },
+
+  insertSnippet: (tabId, text) => {
+    const insert = editors.get(tabId);
+    if (insert) {
+      insert(text);
+      return;
+    }
+    // No editor mounted (the tab is hidden): append to the document instead.
+    set((s) => {
+      const doc = s.docs[tabId];
+      if (!doc) return s;
+      const sep = doc.script && !doc.script.endsWith('\n') ? '\n' : '';
+      return { docs: { ...s.docs, [tabId]: { ...doc, script: doc.script + sep + text } } };
     });
   },
 

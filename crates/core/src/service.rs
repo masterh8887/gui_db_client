@@ -398,15 +398,17 @@ impl BulkDb {
         crate::dbeaver::import_file(Path::new(path))
     }
 
-    /// Build `BULKDB_*` environment variables for injecting a connection's details into a script
-    /// process. The password is read from the credential store (or the in-session cache for
-    /// "ask every time" connections).
-    pub fn conn_script_env(&self, conn_id: &str) -> Result<std::collections::HashMap<String, String>> {
-        let conn = self.conn_get(conn_id)?;
-        let password = self.creds.get(&credentials::db_password_key(conn_id)).ok().flatten().or_else(|| {
-            self.session_secrets.lock().unwrap().get(conn_id).cloned()
-        });
-        Ok(crate::script::connection_env(&conn, password.as_deref()))
+    /// Environment of a script run started from the workspace of `conn_id` (`script::script_env`):
+    /// that connection as `BULKDB_*` variables, plus the saved connections `script` names so it
+    /// can open several at once. Passwords come from the credential store, or from the
+    /// in-session cache for "ask every time" connections.
+    pub fn conn_script_env(&self, conn_id: &str, script: &str) -> Result<HashMap<String, String>> {
+        let default = self.conn_get(conn_id)?;
+        let password_of = |c: &Connection| {
+            let stored = self.creds.get(&credentials::db_password_key(&c.id)).ok().flatten();
+            stored.or_else(|| self.session_secrets.lock().unwrap().get(&c.id).cloned())
+        };
+        Ok(crate::script::script_env(&default, &self.config.connections(), script, password_of))
     }
 
     /// Remember a password typed for an "ask every time" connection for this process.
@@ -1296,6 +1298,37 @@ mod tests {
         // ... clearing the password drops it.
         db.conn_save(ConnectionInput { connection: saved.clone(), clear_password: true, ..Default::default() }).unwrap();
         assert!(!remembered(&db));
+    }
+
+    /// A script gets the stored password of a connection it names, the password typed this
+    /// session for an "ask every time" one, and nothing for a connection it does not name.
+    #[tokio::test]
+    async fn conn_script_env_reads_stored_and_session_passwords_of_named_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BulkDb::new(BulkDbOptions {
+            config_dir: Some(dir.path().to_path_buf()),
+            credentials: Some(Box::new(crate::credentials::MemoryStore::default())),
+            init_logging: false,
+            ..BulkDbOptions::default()
+        })
+        .await
+        .unwrap();
+        let pg =
+            |name: &str, save_password: bool| Connection { name: name.into(), driver: "postgres".into(), host: Some("h".into()), save_password, ..Default::default() };
+        let tab = db.conn_save(ConnectionInput { connection: pg("kpia1", true), password: Some("stored-1".into()), ..Default::default() }).unwrap();
+        let ask = db.conn_save(ConnectionInput { connection: pg("kpia2", false), ..Default::default() }).unwrap();
+        db.remember_secret(&ask, Some("typed-2".into()));
+        db.conn_save(ConnectionInput { connection: pg("prod", true), password: Some("stored-3".into()), ..Default::default() }).unwrap();
+
+        let env = db.conn_script_env(&tab.id, "bulkdb.db('kpia2')").unwrap();
+        assert_eq!(env["BULKDB_PASSWORD"], "stored-1");
+        let list: Vec<serde_json::Value> = serde_json::from_str(&env[crate::script::CONNECTIONS_ENV]).unwrap();
+        let by_name = |name: &str| list.iter().find(|c| c["name"] == name).unwrap();
+        assert_eq!(by_name("kpia1")["password"], "stored-1");
+        assert_eq!(by_name("kpia2")["password"], "typed-2");
+        assert!(by_name("prod").get("password").is_none());
+        assert!(!env[crate::script::CONNECTIONS_ENV].contains("stored-3"));
+        assert_eq!(db.conn_script_env("missing", "").unwrap_err().code(), "NOT_FOUND");
     }
 
     /// A keyring failure after the connection file was written must not skip the cache

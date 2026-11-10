@@ -89,7 +89,13 @@ export function WorkspaceTabBar({ connId }: { connId: string }) {
   const activeId = useTabsStore((s) => s.sets[connId]?.activeId ?? null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const openQuery = () => useTabsStore.getState().openQuery(connId);
-  const openScript = () => useTabsStore.getState().openScript(connId);
+  const openScript = () => {
+    useTabsStore.getState().openScript(connId);
+    // Reveal the script palette (connections, snippets, export builder) in the right inspector.
+    const ui = useUiStore.getState();
+    ui.setInspectorSegment('details');
+    ui.setInspectorOpen(true);
+  };
 
   return (
     <TabBar
