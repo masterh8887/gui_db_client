@@ -8,34 +8,54 @@ use std::collections::HashMap;
 
 use crate::types::{Connection, RuntimeInfo, ScriptRuntime};
 
+/// The executable names to try for `runtime`, in order. On Windows the Python launcher `py` and a
+/// real `python` come before `python3`, because `python3` is usually the Microsoft Store alias
+/// (`...\WindowsApps\python3.exe`), which is not a working interpreter.
+pub fn runtime_candidates(runtime: ScriptRuntime) -> &'static [&'static str] {
+    match runtime {
+        ScriptRuntime::Node => &["node"],
+        ScriptRuntime::Python => {
+            #[cfg(windows)]
+            {
+                &["py", "python", "python3"]
+            }
+            #[cfg(not(windows))]
+            {
+                &["python3", "python"]
+            }
+        }
+        ScriptRuntime::Bash => &["bash"],
+    }
+}
+
+/// A real `--version` line prints a dotted number. The Windows Store `python3` alias prints just
+/// `Python` (to stderr, exit 9009) and a missing executable prints nothing, so both are rejected.
+fn looks_like_version(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Probe whether `runtime` is installed and return its version + path, or `None` if not found.
 pub fn detect_runtime(runtime: ScriptRuntime) -> Option<RuntimeInfo> {
-    let candidates: &[&str] = match runtime {
-        ScriptRuntime::Node => &["node"],
-        ScriptRuntime::Python => &["python3", "python"],
-        ScriptRuntime::Bash => &["bash"],
-    };
-    for exe in candidates {
-        if let Some(info) = probe_exe(runtime, exe) {
-            return Some(info);
-        }
-    }
-    None
+    runtime_candidates(runtime).iter().find_map(|exe| probe_exe(runtime, exe))
 }
 
 fn probe_exe(runtime: ScriptRuntime, exe: &str) -> Option<RuntimeInfo> {
     let out = std::process::Command::new(exe).arg("--version").output().ok()?;
-    if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
-        return None;
-    }
-    // Node / Python print to stdout; some tools use stderr for --version.
-    let raw = if out.stdout.is_empty() { out.stderr } else { out.stdout };
-    let version = String::from_utf8_lossy(&raw).trim().to_string();
-    if version.is_empty() {
+    // Node / Python print to stdout; some tools (and older Python) use stderr for --version.
+    let raw = if !out.stdout.is_empty() { &out.stdout } else { &out.stderr };
+    let version = String::from_utf8_lossy(raw).trim().to_string();
+    if !looks_like_version(&version) {
         return None;
     }
     let path = which_exe(exe).unwrap_or_else(|| exe.to_string());
     Some(RuntimeInfo { runtime, version, path })
+}
+
+/// The interpreter to actually spawn: the resolved path of a detected runtime, so a script runs
+/// under the same interpreter the version badge shows (never the Store alias). Falls back to the
+/// first candidate name when nothing is detected, so the spawn fails with a clear error.
+pub fn runtime_exe(runtime: ScriptRuntime) -> String {
+    detect_runtime(runtime).map(|info| info.path).unwrap_or_else(|| runtime_candidates(runtime)[0].to_string())
 }
 
 fn which_exe(name: &str) -> Option<String> {
@@ -89,16 +109,10 @@ pub fn node_helper_js() -> &'static str {
     include_str!("node_helper.js")
 }
 
-/// Executable + args to run `script_path` with the given runtime.
-pub fn runtime_args(runtime: ScriptRuntime) -> (&'static str, &'static [&'static str]) {
-    match runtime {
-        ScriptRuntime::Node => ("node", &[]),
-        #[cfg(windows)]
-        ScriptRuntime::Python => ("python", &[]),
-        #[cfg(not(windows))]
-        ScriptRuntime::Python => ("python3", &[]),
-        ScriptRuntime::Bash => ("bash", &[]),
-    }
+/// The Python helper + launcher. The shell runs `python <this> <script.py>`: it defines the
+/// global `bulkdb` (the Node helper's counterpart) and then execs the user's script as `__main__`.
+pub fn python_helper_py() -> &'static str {
+    include_str!("python_helper.py")
 }
 
 /// Variable that lists the saved connections for a script run (a JSON array, see [`script_env`]).
@@ -189,6 +203,41 @@ mod tests {
 
     fn listed(env: &HashMap<String, String>) -> Vec<serde_json::Value> {
         serde_json::from_str(&env[CONNECTIONS_ENV]).unwrap()
+    }
+
+    /// Only a real `--version` line (with a dotted number) counts; the Windows Store `python3`
+    /// alias prints just "Python" and must be rejected.
+    #[test]
+    fn version_lines_need_a_digit() {
+        assert!(looks_like_version("Python 3.14.10"));
+        assert!(looks_like_version("v26.8.1"));
+        assert!(looks_like_version("GNU bash, version 5.2.21(1)-release"));
+        assert!(!looks_like_version("Python")); // the Store alias's output
+        assert!(!looks_like_version(""));
+    }
+
+    /// On Windows the Python launcher `py` is tried before `python3` (the Store alias).
+    #[test]
+    fn windows_prefers_py_over_store_alias() {
+        let python = runtime_candidates(ScriptRuntime::Python);
+        if cfg!(windows) {
+            assert_eq!(python.first(), Some(&"py"));
+            assert!(python.iter().position(|e| *e == "py").unwrap() < python.iter().position(|e| *e == "python3").unwrap());
+        } else {
+            assert_eq!(python.first(), Some(&"python3"));
+        }
+    }
+
+    /// Whatever this machine has, a detected runtime always reports a version that looks real and
+    /// an executable to run it with.
+    #[test]
+    fn detected_runtime_is_consistent() {
+        for runtime in [ScriptRuntime::Node, ScriptRuntime::Python, ScriptRuntime::Bash] {
+            if let Some(info) = detect_runtime(runtime) {
+                assert!(looks_like_version(&info.version), "{runtime:?}: {:?}", info.version);
+                assert!(!runtime_exe(runtime).is_empty());
+            }
+        }
     }
 
     /// The tab's connection and the ones the source names get their details and passwords. The

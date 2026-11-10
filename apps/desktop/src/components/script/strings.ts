@@ -5,6 +5,7 @@ const STRINGS = {
   runtimePython: 'Python',
   runtimeBash: 'Bash',
   notInstalled: '미설치',
+  recheck: '다시 확인 (설치했는데도 미설치로 보이면 클릭)',
   install: '설치',
   installing: '설치 중…',
   detecting: '확인 중…',
@@ -37,11 +38,23 @@ await bulkdb.toXlsx({ 사용자: users, 주문: orders }, 'out.xlsx'); // 시트
 // 직접 SQL:            await a.query('SELECT COUNT(*) AS n FROM users')
 // 같은 서버의 다른 DB:  a.use('db이름').from('테이블')
 // 이 탭의 연결만 쓸 때: bulkdb.from('테이블') / bulkdb.query('SELECT ...')`,
-  placeholderPython: `# Python 스크립트
-# BULKDB_HOST, BULKDB_PORT, BULKDB_DATABASE, BULKDB_USER, BULKDB_PASSWORD 환경변수 사용 가능
-# BULKDB_CONNECTIONS: 스크립트에 이름을 적은 다른 연결들의 접속 정보 (JSON 배열)
-import os, sys
-print('host:', os.environ.get('BULKDB_HOST'))`,
+  placeholderPython: `# Python 스크립트 — bulkdb 가 자동으로 준비됩니다 (읽기 전용: SELECT / WITH 만 실행)
+# SQLite 는 설치 불필요. PostgreSQL=psycopg2 · MySQL=pymysql · SQL Server=pyodbc (pip install)
+
+# 저장된 연결을 이름으로 엽니다. 한 스크립트에서 여러 DB 를 함께 쓸 수 있습니다.
+a = bulkdb.db('연결 이름')
+b = bulkdb.db('다른 연결 이름')
+
+users = a.from_('users').select('id', 'name').where({'status': 'active'}).limit(100).fetch()
+orders = b.from_('orders').where({'user_id': [u['id'] for u in users]}).fetch()  # 리스트는 IN (...)
+
+# 엑셀/CSV 로 저장 (오른쪽 패널에서 구조를 만들고 클릭으로 삽입할 수 있습니다)
+bulkdb.to_xlsx({'사용자': users, '주문': orders}, 'out.xlsx')  # 시트별로 분리
+# bulkdb.to_csv(users, 'users.csv')
+
+# 직접 SQL:            a.query('SELECT COUNT(*) AS n FROM users')
+# 같은 서버의 다른 DB:  a.use('db이름').from_('테이블')
+# 이 탭의 연결만 쓸 때: bulkdb.from_('테이블') / bulkdb.query('SELECT ...')`,
   placeholderBash: `#!/usr/bin/env bash
 # Bash 스크립트 — BULKDB_* 환경변수 사용 가능
 # BULKDB_CONNECTIONS: 스크립트에 이름을 적은 다른 연결들의 접속 정보 (JSON 배열)

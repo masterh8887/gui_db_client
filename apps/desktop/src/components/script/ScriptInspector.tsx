@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils';
 import { Badge, Button, EnvTag, Input, SegmentedControl, Tooltip } from '@/components/ui';
 import { useConnectionsStore } from '@/stores/connections';
 import { useScriptStore } from '@/stores/script';
-import { connectionSnippet, exportCode, snippetGroups, type ExportSheet } from './snippets';
+import { connectionSnippet, exportCode, snippetGroups, type ExportRuntime, type ExportSheet } from './snippets';
 import { is } from './strings';
 
 const DRIVER_LABEL: Record<string, string> = { postgres: 'PostgreSQL', mysql: 'MySQL', sqlite: 'SQLite', mssql: 'SQL Server', oracle: 'Oracle', odbc: 'ODBC' };
@@ -106,7 +106,7 @@ function parseCols(raw: string): string[] {
     .filter(Boolean);
 }
 
-function ExportSection({ tabId }: { tabId: string }) {
+function ExportSection({ tabId, runtime }: { tabId: string; runtime: ExportRuntime }) {
   const [format, setFormat] = useState<'xlsx' | 'csv'>('xlsx');
   const [filename, setFilename] = useState('out.xlsx');
   const [sheets, setSheets] = useState<SheetDraft[]>([{ name: 'Sheet1', cols: '' }]);
@@ -127,7 +127,7 @@ function ExportSection({ tabId }: { tabId: string }) {
 
   const insert = () => {
     const defined = previewSheets.filter((s) => s.columns.length || sheets.length > 1);
-    useScriptStore.getState().insertSnippet(tabId, exportCode(defined.length ? defined : previewSheets, filename.trim() || 'out.' + format, format));
+    useScriptStore.getState().insertSnippet(tabId, exportCode(defined.length ? defined : previewSheets, filename.trim() || 'out.' + format, format, runtime));
   };
 
   return (
@@ -218,12 +218,13 @@ function ColumnPreview({ columns }: { columns: string[] }) {
 
 export function ScriptInspector({ tabId, connId }: { tabId: string; connId: string }) {
   const runtime = useScriptStore((s) => s.docs[tabId]?.runtime ?? 'node');
-  const node = runtime === 'node';
+  // The export builder makes sense for Node and Python (not Bash).
+  const exportRuntime: ExportRuntime | null = runtime === 'node' ? 'node' : runtime === 'python' ? 'python' : null;
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-3">
       <ConnectionsSection tabId={tabId} connId={connId} runtime={runtime} />
       <SnippetsSection tabId={tabId} runtime={runtime} />
-      {node && <ExportSection tabId={tabId} />}
+      {exportRuntime && <ExportSection tabId={tabId} runtime={exportRuntime} />}
     </div>
   );
 }

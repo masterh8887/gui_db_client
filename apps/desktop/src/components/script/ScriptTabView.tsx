@@ -30,7 +30,15 @@ function RuntimeBadge({ runtime }: { runtime: ScriptRuntime }) {
   }, [runtime, info, store]);
 
   if (info === undefined) return <span className="text-fg-secondary text-xs">{ss('detecting')}</span>;
-  if (info === null) return <span className="text-fg-danger text-xs">{ss('notInstalled')}</span>;
+  if (info === null) {
+    return (
+      <Tooltip content={ss('recheck')}>
+        <button type="button" onClick={() => void store().redetectRuntime(runtime)} className="rounded px-1 text-fg-danger text-xs hover:bg-hover">
+          {ss('notInstalled')}
+        </button>
+      </Tooltip>
+    );
+  }
   return <span className="text-fg-success text-xs font-mono">{info.version}</span>;
 }
 
@@ -48,7 +56,8 @@ function ScriptBar({ tabId }: { tabId: string }) {
     checked: runtime === r,
     onSelect: () => {
       store().setRuntime(tabId, r);
-      void store().detectRuntime(r);
+      // Re-pick forces a fresh probe, so a stale "not installed" can be cleared.
+      void store().redetectRuntime(r);
     },
   }));
 

@@ -561,11 +561,16 @@ pub async fn script_run(
                 return;
             }
         };
-        // For Node.js: write the bulkdb helper and inject it via --require.
-        let helper_tmp = if runtime == ScriptRuntime::Node {
-            let content = bulk_core::script::node_helper_js();
+        // The `bulkdb` helper: Node loads it with --require; Python runs it as a launcher that
+        // execs the script; Bash has none. Both are written to a temp file beside the script.
+        let helper = match runtime {
+            ScriptRuntime::Node => Some(("-bulkdb.cjs", bulk_core::script::node_helper_js())),
+            ScriptRuntime::Python => Some(("-bulkdb.py", bulk_core::script::python_helper_py())),
+            ScriptRuntime::Bash => None,
+        };
+        let helper_tmp = if let Some((suffix, content)) = helper {
             match tokio::task::spawn_blocking(move || {
-                let mut f = tempfile::Builder::new().suffix("-bulkdb.cjs").tempfile()?;
+                let mut f = tempfile::Builder::new().suffix(suffix).tempfile()?;
                 use std::io::Write;
                 f.write_all(content.as_bytes())?;
                 f.flush()?;
@@ -580,12 +585,22 @@ pub async fn script_run(
             None
         };
 
-        let (exe, extra_args) = bulk_core::script::runtime_args(runtime);
+        let exe = bulk_core::script::runtime_exe(runtime);
         let script_path = tmp.path().to_string_lossy().into_owned();
-        let mut cmd = TokioCommand::new(exe);
-        cmd.args(extra_args);
-        if let Some(ref h) = helper_tmp {
-            cmd.arg("--require").arg(h.path());
+        let mut cmd = TokioCommand::new(&exe);
+        match (runtime, helper_tmp.as_ref()) {
+            (ScriptRuntime::Node, Some(h)) => {
+                cmd.arg("--require").arg(h.path());
+            }
+            (ScriptRuntime::Python, Some(h)) => {
+                // `python <helper> <script>`: the helper defines bulkdb then execs the script.
+                cmd.arg(h.path());
+            }
+            _ => {}
+        }
+        if runtime == ScriptRuntime::Python {
+            // Make stdout/stderr and file I/O UTF-8 so Korean survives the pipe on Windows.
+            cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
         }
         cmd.arg(&script_path).envs(&env).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         match cmd.spawn() {

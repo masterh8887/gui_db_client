@@ -27,18 +27,14 @@ export function connIdent(name: string): string {
 
 const jsString = (s: string) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 
+const pyString = (s: string) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+
 /** The line that opens a saved connection by name, for the active runtime. */
 export function connectionSnippet(runtime: ScriptRuntime, name: string, isTabConn: boolean): string {
   if (runtime === 'node') return `const ${connIdent(name)} = bulkdb.db(${jsString(name)});`;
-  if (runtime === 'python') {
-    return isTabConn
-      ? `import os\nhost = os.environ['BULKDB_HOST']  # ${name} (이 탭의 연결)`
-      : `import json, os\nconns = json.loads(os.environ.get('BULKDB_CONNECTIONS', '[]'))\n${connIdent(name)} = next(c for c in conns if c['name'] == ${jsPy(name)})`;
-  }
+  if (runtime === 'python') return `${connIdent(name)} = bulkdb.db(${pyString(name)})`;
   return `# ${name}${isTabConn ? ' (이 탭의 연결: $BULKDB_HOST 등)' : ' — BULKDB_CONNECTIONS 에서 접근'}`;
 }
-
-const jsPy = (s: string) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 
 // ----- Node: the bulkdb helper ---------------------------------------------------------------
 
@@ -96,40 +92,45 @@ const NODE: SnippetGroup[] = [
 
 // ----- Python ---------------------------------------------------------------------------------
 
+// Python's bulkdb helper mirrors Node's, but synchronous (no await) and with snake_case names;
+// `from_` because `from` is a Python keyword.
 const PYTHON: SnippetGroup[] = [
   {
-    title: '연결',
+    title: '쿼리',
     items: [
       {
-        id: 'env',
-        label: '접속 정보 읽기',
-        hint: 'BULKDB_* 환경변수 / BULKDB_CONNECTIONS',
-        code: `import os, json\nhost = os.environ['BULKDB_HOST']\nconns = json.loads(os.environ.get('BULKDB_CONNECTIONS', '[]'))  # 스크립트에 이름을 적은 연결들`,
+        id: 'select',
+        label: '쿼리 빌더',
+        hint: "bulkdb.from_('테이블').select(...).where(...).fetch()",
+        code: `rows = bulkdb.from_('테이블') \\\n    .select('컬럼1', '컬럼2') \\\n    .where({'status': 'active'}) \\\n    .limit(100) \\\n    .fetch()\nprint(len(rows))`,
       },
-      {
-        id: 'psycopg',
-        label: 'PostgreSQL 연결 (psycopg2)',
-        hint: 'pip install psycopg2-binary',
-        code: `import os, psycopg2\nconn = psycopg2.connect(\n    host=os.environ['BULKDB_HOST'], port=os.environ['BULKDB_PORT'],\n    dbname=os.environ['BULKDB_DATABASE'], user=os.environ['BULKDB_USER'],\n    password=os.environ['BULKDB_PASSWORD'])\ncur = conn.cursor(); cur.execute('SELECT 1'); print(cur.fetchall())`,
-      },
-      {
-        id: 'pymysql',
-        label: 'MySQL 연결 (PyMySQL)',
-        hint: 'pip install pymysql',
-        code: `import os, pymysql\nconn = pymysql.connect(\n    host=os.environ['BULKDB_HOST'], port=int(os.environ['BULKDB_PORT']),\n    database=os.environ['BULKDB_DATABASE'], user=os.environ['BULKDB_USER'],\n    password=os.environ['BULKDB_PASSWORD'], cursorclass=pymysql.cursors.DictCursor)`,
-      },
+      { id: 'raw', label: '직접 SQL', hint: "bulkdb.query('SELECT ...', [params])", code: `rows = bulkdb.query('SELECT * FROM 테이블 WHERE id = ?', [1])  # sqlite/mssql 은 ?, postgres/mysql 은 %s` },
+      { id: 'one', label: '첫 행', hint: '.fetch_one() — 한 행 또는 None', code: `row = bulkdb.from_('테이블').where({'id': 1}).fetch_one()` },
+      { id: 'count', label: '행 개수', hint: '.count() — 조건에 맞는 행 수', code: `n = bulkdb.from_('테이블').where({'status': 'active'}).count()\nprint(n)` },
+      { id: 'in', label: 'IN 조건', hint: '리스트를 넘기면 IN (...)', code: `rows = bulkdb.from_('테이블').where({'id': [1, 2, 3]}).fetch()` },
+      { id: 'otherdb', label: '다른 연결', hint: "bulkdb.db('연결이름') — 다른 저장된 DB", code: `other = bulkdb.db('연결이름')\nrows = other.from_('테이블').fetch()` },
+      { id: 'usedb', label: '같은 서버 다른 DB', hint: ".use('db이름')", code: `db2 = bulkdb.use('db이름')\nrows = db2.from_('테이블').fetch()` },
     ],
   },
   {
     title: '엑셀 · CSV 내보내기',
     items: [
-      { id: 'pandas', label: 'pandas 로 엑셀', hint: 'pip install pandas openpyxl', code: `import pandas as pd\npd.DataFrame(rows).to_excel('out.xlsx', index=False)` },
+      { id: 'xlsx', label: 'XLSX 내보내기', hint: "bulkdb.to_xlsx(rows, 'out.xlsx') — 무설치", code: `bulkdb.to_xlsx(rows, 'out.xlsx')` },
+      { id: 'csv', label: 'CSV 내보내기', hint: "bulkdb.to_csv(rows, 'out.csv') — 한글 엑셀 호환", code: `bulkdb.to_csv(rows, 'out.csv')` },
+      { id: 'xlsx-multi', label: '멀티시트 XLSX', hint: '두 DB의 결과를 시트로 분리', code: `bulkdb.to_xlsx({\n    '시트1': rows1,\n    '합계': summary,\n}, 'out.xlsx')` },
+      { id: 'xlsx-cols', label: '컬럼 지정 내보내기', hint: '출력 컬럼과 순서를 직접 지정', code: `bulkdb.to_xlsx(rows, 'out.xlsx', columns=['컬럼1', '컬럼2'])` },
+    ],
+  },
+  {
+    title: '패턴 · 유틸',
+    items: [
       {
-        id: 'csv',
-        label: 'CSV (한글 엑셀 호환)',
-        hint: 'utf-8-sig (BOM)',
-        code: `import csv\nwith open('out.csv', 'w', newline='', encoding='utf-8-sig') as f:\n    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))\n    w.writeheader(); w.writerows(rows)`,
+        id: 'two-db',
+        label: '2개 DB 결합',
+        hint: '한 DB의 결과로 다른 DB를 조회',
+        code: `a = bulkdb.db('연결A')\nb = bulkdb.db('연결B')\nusers = a.from_('users').select('id', 'name').where({'status': 'active'}).fetch()\norders = b.from_('orders').where({'user_id': [u['id'] for u in users]}).fetch()\nby_user = {u['id']: dict(u, total=0) for u in users}\nfor o in orders:\n    by_user[o['user_id']]['total'] += o['total']\nsummary = list(by_user.values())\nbulkdb.to_xlsx(summary, 'summary.xlsx')`,
       },
+      { id: 'print', label: 'print', hint: '값 출력', code: `print()` },
     ],
   },
 ];
@@ -158,7 +159,14 @@ export interface ExportSheet {
   columns: string[];
 }
 
-export function exportCode(sheets: ExportSheet[], filename: string, format: 'xlsx' | 'csv'): string {
+/** The runtimes the export builder can generate code for (Bash has no natural fit). */
+export type ExportRuntime = 'node' | 'python';
+
+export function exportCode(sheets: ExportSheet[], filename: string, format: 'xlsx' | 'csv', runtime: ExportRuntime): string {
+  return runtime === 'python' ? pythonExport(sheets, filename, format) : nodeExport(sheets, filename, format);
+}
+
+function nodeExport(sheets: ExportSheet[], filename: string, format: 'xlsx' | 'csv'): string {
   const file = jsString(filename);
   const colsOpt = (cols: string[]) => (cols.length ? `, { columns: [${cols.map(jsString).join(', ')}] }` : '');
   if (format === 'csv') {
@@ -172,4 +180,20 @@ export function exportCode(sheets: ExportSheet[], filename: string, format: 'xls
   const decls = sheets.map((s, i) => `const rows${i + 1} = []; // ${s.name}`).join('\n');
   const body = sheets.map((s, i) => `  ${jsString(s.name)}: rows${i + 1},`).join('\n');
   return `${decls}\nawait bulkdb.toXlsx({\n${body}\n}, ${file});`;
+}
+
+function pythonExport(sheets: ExportSheet[], filename: string, format: 'xlsx' | 'csv'): string {
+  const file = pyString(filename);
+  const colsKw = (cols: string[]) => (cols.length ? `, columns=[${cols.map(pyString).join(', ')}]` : '');
+  if (format === 'csv') {
+    const cols = sheets[0]?.columns ?? [];
+    return `rows = []  # 여기에 행(dict)을 채우세요 (예: bulkdb.from_('테이블').select(...).fetch())\nbulkdb.to_csv(rows, ${file}${colsKw(cols)})`;
+  }
+  if (sheets.length <= 1) {
+    const cols = sheets[0]?.columns ?? [];
+    return `rows = []  # 여기에 행(dict)을 채우세요\nbulkdb.to_xlsx(rows, ${file}${colsKw(cols)})`;
+  }
+  const decls = sheets.map((s, i) => `rows${i + 1} = []  # ${s.name}`).join('\n');
+  const body = sheets.map((s, i) => `    ${pyString(s.name)}: rows${i + 1},`).join('\n');
+  return `${decls}\nbulkdb.to_xlsx({\n${body}\n}, ${file})`;
 }

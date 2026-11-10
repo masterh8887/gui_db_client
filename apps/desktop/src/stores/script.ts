@@ -44,6 +44,8 @@ export interface ScriptState {
   insertSnippet(tabId: string, text: string): void;
   clearLog(tabId: string): void;
   detectRuntime(runtime: ScriptRuntime): Promise<RuntimeInfo | null>;
+  /** Probe again, ignoring a cached result (e.g. after installing the runtime). */
+  redetectRuntime(runtime: ScriptRuntime): Promise<RuntimeInfo | null>;
   installRuntime(tabId: string, runtime: ScriptRuntime): Promise<void>;
   run(tabId: string): Promise<void>;
   cancel(tabId: string): Promise<void>;
@@ -175,6 +177,14 @@ export const useScriptStore = create<ScriptState>()((set, get) => ({
       set((s) => ({ runtimeInfo: { ...s.runtimeInfo, [runtime]: null } }));
       return null;
     }
+  },
+
+  redetectRuntime: (runtime) => {
+    // Drop the cached result (back to "checking…") so detectRuntime probes again. Without this a
+    // one-time "not installed" (e.g. probed while the backend was mid-rebuild) would stick for the
+    // whole session even after the runtime is available.
+    set((s) => ({ runtimeInfo: { ...s.runtimeInfo, [runtime]: undefined } }));
+    return get().detectRuntime(runtime);
   },
 
   installRuntime: async (tabId, runtime) => {

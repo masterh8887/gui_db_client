@@ -83,4 +83,32 @@ describe('ScriptInspector', () => {
     expect(code).toContain('const rows2 = [];');
     expect(code).toContain("}, 'out.xlsx');");
   });
+
+  describe('python runtime', () => {
+    function pythonSetup() {
+      const r = setup();
+      useScriptStore.getState().setRuntime(TAB, 'python');
+      return r;
+    }
+
+    it('shows the export builder and inserts sync bulkdb python code', async () => {
+      const user = userEvent.setup();
+      const { connId } = pythonSetup();
+      renderInspector(connId);
+
+      await user.type(screen.getByLabelText('컬럼'), 'id, name');
+      await user.click(screen.getByRole('button', { name: '내보내기 코드 삽입' }));
+      const code = script();
+      expect(code).toContain("bulkdb.to_xlsx(rows, 'out.xlsx', columns=['id', 'name'])");
+      expect(code).not.toContain('await');
+    });
+
+    it('inserts a python bulkdb connection by name', async () => {
+      const user = userEvent.setup();
+      const { conns, connId } = pythonSetup();
+      renderInspector(connId);
+      await user.click(screen.getByText(conns[1].name));
+      expect(script()).toContain(`= bulkdb.db('${conns[1].name}')`);
+    });
+  });
 });
