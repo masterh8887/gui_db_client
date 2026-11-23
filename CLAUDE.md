@@ -51,6 +51,7 @@ cargo fmt --all                       # rustfmt.toml: max_width 170 (CI runs --c
 cargo run -p bulk-cli -- export --driver sqlite --path test.db --query "select 1" --out out.csv --progress
 pnpm install                          # pnpm 12.14.0 exactly (engine-strict)
 pnpm typegen                          # regenerate packages/ipc-types from Rust
+pnpm target:prune                     # delete every build of the workspace crates from target/debug
 pnpm --filter desktop lint            # eslint + tsc
 pnpm --filter desktop test            # vitest
 pnpm --filter desktop build:web       # next export → apps/desktop/out
@@ -59,6 +60,13 @@ pnpm --filter desktop dev             # tauri dev (opens the window)
 
 Run cargo from the repo root. The Cargo target dir is shared; concurrent cargo invocations
 queue on the build lock (that is fine).
+
+Cargo never deletes old builds: each change of dependencies, features or profile settings
+leaves the previous copies in `target/debug` (it reached 160 GB in the first month). After such
+a change run `pnpm target:prune` (removes every build of the three workspace crates, keeps
+dependency builds and `target/release`). After a toolchain bump run `cargo clean --profile dev`
+instead. Never run plain `cargo clean` or `cargo clean --release`: they also delete the
+installers in `target/release/bundle` and the logs in `target/gate`.
 
 ## Conventions
 

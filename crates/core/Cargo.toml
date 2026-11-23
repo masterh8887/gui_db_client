@@ -17,7 +17,7 @@ mssql = ["dep:tiberius"]
 sqlite = []            # rusqlite is always linked (history.sqlite needs it)
 odbc = ["dep:odbc-api"] # build.rs only enables the `has_odbc` cfg on Windows (or BULKDB_ODBC=1)
 oracle = ["dep:oracle"]
-ts-export = []          # `cargo test --features ts-export export_bindings` regenerates packages/ipc-types
+ts-export = []          # `cargo test --features ts-export --lib export_bindings` regenerates packages/ipc-types
 it = []                 # integration tests that need docker databases
 
 [dependencies]

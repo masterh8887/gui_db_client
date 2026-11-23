@@ -14,8 +14,9 @@
     "core:test": "cargo test -p bulk-core",
     "core:bench": "cargo bench -p bulk-core --bench pipeline",
     "cli": "cargo run -p bulk-cli --",
-    "typegen": "cargo test -p bulk-core --features ts-export export_bindings",
-    "typegen:check": "node scripts/typegen-check.mjs"
+    "typegen": "cargo test -p bulk-core --features ts-export --lib export_bindings",
+    "typegen:check": "node scripts/typegen-check.mjs",
+    "target:prune": "cargo clean --workspace"
   },
   "devDependencies": {
     "turbo": "^2"

@@ -64,5 +64,13 @@ codegen-units = 1
 strip = true
 panic = "unwind"
 
+# Debug builds: full debug info made target/debug grow to 160+ GB in a month (PDBs and the
+# incremental cache). Line tables keep file:line in backtraces of workspace code; dependencies
+# carry no debug info. Measured: one `cargo test -p bulk-core` build 6.2 GB -> 2.3 GB.
+# Keep these in this file only: a per-command override (env var, --config) builds a second copy.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 1
+debug = false

@@ -2,7 +2,7 @@
 //
 // Two checks, both must pass:
 //  1. Drift: the files under packages/ipc-types/src/generated before and after
-//     `cargo test -p bulk-core --features ts-export export_bindings` must be identical
+//     `cargo test -p bulk-core --features ts-export --lib export_bindings` must be identical
 //     (compared with line endings normalised, so a CRLF checkout on Windows is not drift).
 //  2. Committed: inside a git work tree, `git status --porcelain` for packages/ipc-types/src
 //     must be empty after regeneration. Generated files that are untracked or modified would
@@ -45,7 +45,7 @@ function uncommitted() {
 }
 
 const before = snapshot();
-execSync('cargo test -p bulk-core --features ts-export export_bindings', { cwd: root, stdio: 'inherit' });
+execSync('cargo test -p bulk-core --features ts-export --lib export_bindings', { cwd: root, stdio: 'inherit' });
 const after = snapshot();
 
 const files = new Set([...Object.keys(before), ...Object.keys(after)]);
